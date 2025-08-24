@@ -35,6 +35,10 @@ db = SQLAlchemy(app)
 # Shared secret for TradingView (or any webhook caller)
 TRADINGVIEW_WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET")
 
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
 
 # =========================
 # Feature flags & defaults
@@ -1168,7 +1172,6 @@ def live_trade():
         return jsonify({"status": "success", "order": order})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
-
 
 @app.route('/signal', methods=['POST'])
 def signal():
