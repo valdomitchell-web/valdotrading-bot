@@ -245,6 +245,13 @@ class TrailingCfg(db.Model):
     arm_pct = db.Column(db.Float, default=0.0)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+# Ensure all tables exist when the app boots under Gunicorn
+with app.app_context():
+    # Touch models so SQLAlchemy registers them
+    _ = (User.__table__, Trade.__table__, Position.__table__)
+    db.create_all()
+
+
 # --- DB bootstrap (runs once on startup) ---
 
 def _bootstrap_db_once():
