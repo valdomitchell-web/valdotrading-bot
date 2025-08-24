@@ -19,7 +19,7 @@ from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import check_password_hash, generate_password_hash
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-
+from werkzeug.security import generate_password_hash
 
 # =========================
 # Load env & Flask config
@@ -244,6 +244,33 @@ class TrailingCfg(db.Model):
     trail_pct = db.Column(db.Float, default=0.0)  # e.g. 0.01 = 1%
     arm_pct = db.Column(db.Float, default=0.0)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+# --- DB bootstrap (runs once on startup) ---
+
+def _bootstrap_db_once():
+    try:
+        with app.app_context():
+            # If your models live in other modules, import them here
+            # from models import User, Trade, Position
+            db.create_all()
+
+            admin = User.query.filter_by(username='admin').first()
+            if not admin:
+                pwd = os.environ.get("ADMIN_PASSWORD", "ChangeMe123!")
+                db.session.add(User(username="admin",
+                                    password_hash=generate_password_hash(pwd)))
+                db.session.commit()
+                app.logger.info("DB ready: admin user created")
+            else:
+                app.logger.info("DB ready: tables exist")
+    except Exception as e:
+        # very important: clear a failed transaction so future queries work
+        db.session.rollback()
+        app.logger.exception("DB bootstrap failed: %s", e)
+
+_bootstrap_db_once()
+# --- end bootstrap ---
+
 
 # ============== Auth helpers ==============
 def is_authorized(req) -> bool:
@@ -1611,6 +1638,7 @@ def monitor_trades():
             time.sleep(10)
 
 threading.Thread(target=monitor_trades, daemon=True).start()
+
 
 # ============== App start ==============
 if __name__ == '__main__':
