@@ -1026,6 +1026,31 @@ def trail_status():
 
     return jsonify({"ok": True, "rows": out})
 
+# --- one-time DB bootstrap (disable/remove after use) ---
+ADMIN_SETUP_TOKEN = os.getenv("ADMIN_SETUP_TOKEN")
+ADMIN_INITIAL_PASSWORD = os.getenv("ADMIN_INITIAL_PASSWORD", "ChangeMe123!")
+
+@app.route("/admin_bootstrap", methods=["GET","POST"])
+def admin_bootstrap():
+    # token can come from ?token=... or {"token": "..."} body
+    token = request.args.get("token") or ((request.get_json(silent=True) or {}).get("token"))
+    if not ADMIN_SETUP_TOKEN or token != ADMIN_SETUP_TOKEN:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    try:
+        db.create_all()
+        created = False
+        if not User.query.filter_by(username="admin").first():
+            pw_hash = generate_password_hash(ADMIN_INITIAL_PASSWORD)
+            db.session.add(User(username="admin", password_hash=pw_hash))
+            db.session.commit()
+            created = True
+        return jsonify({"ok": True, "db_initialized": True, "admin_created": created})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ============== Trading endpoints ==============
 @app.route('/live_trade', methods=['POST'])
 def live_trade():
