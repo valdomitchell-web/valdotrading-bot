@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+  <h2>Trailing Stop Configurations</h2>
+
+  <!-- Table of configs -->
+  <table class="table table-bordered mt-3">
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Mode</th>
+        <th>Arm Trigger</th>
+        <th>Config Details</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for cfg in configs %}
+      <tr>
+        <td>{{ cfg.symbol }}</td>
+        <td>{{ cfg.config.mode }}</td>
+        <td>{{ (cfg.config.arm_trigger * 100) | round(2) }}%</td>
+        <td>
+          {% if cfg.config.mode == "static" %}
+            Trail: {{ (cfg.config.trail*100) | round(2) }}%
+          {% elif cfg.config.mode == "multi-step" %}
+            <ul>
+              {% for step in cfg.config.steps %}
+                <li>≥ {{ (step.trigger*100) | round(1) }}% → Trail {{ (step.trail*100) | round(1) }}%</li>
+              {% endfor %}
+            </ul>
+          {% elif cfg.config.mode == "dynamic" %}
+            Base Trail: {{ (cfg.config.base_trail*100) | round(2) }}%
+          {% endif %}
+        </td>
+        <td>{{ "Active" if cfg.active else "Inactive" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <!-- Add/Edit Config Form -->
+  <h3 class="mt-5">Add / Update Config</h3>
+  <form method="post">
+    <div class="form-group">
+      <label>Symbol</label>
+      <input type="text" class="form-control" name="symbol" required>
+    </div>
+    <div class="form-group mt-2">
+      <label>Mode</label>
+      <select class="form-control" name="mode" required>
+        <option value="static">Static</option>
+        <option value="multi-step">Multi-Step</option>
+        <option value="dynamic">Dynamic</option>
+      </select>
+    </div>
+    <div class="form-group mt-2">
+      <label>Arm Trigger (%)</label>
+      <input type="number" step="0.001" class="form-control" name="arm_trigger" placeholder="e.g. 0.02 = 2%">
+    </div>
+    <div class="form-group mt-2">
+      <label>Static Trail (if mode=static)</label>
+      <input type="number" step="0.001" class="form-control" name="trail" placeholder="e.g. 0.01 = 1%">
+    </div>
+    <div class="form-group mt-2">
+      <label>Steps (if mode=multi-step)</label>
+      <textarea class="form-control" name="steps" placeholder="Format: trigger,trail (one per line)\n0.03,0.015\n0.06,0.025"></textarea>
+    </div>
+    <div class="form-group mt-2">
+      <label>Base Trail (if mode=dynamic)</label>
+      <input type="number" step="0.001" class="form-control" name="base_trail" placeholder="e.g. 0.01 = 1%">
+    </div>
+    <button type="submit" class="btn btn-primary mt-3">Save Config</button>
+  </form>
+</div>
+{% endblock %}

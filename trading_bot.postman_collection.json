@@ -1,0 +1,138 @@
+{
+  "info": {
+    "name": "Trading Bot Controls",
+    "_postman_id": "92a1c5de-3c23-4b65-a4c8-2c19ffb8e7f9",
+    "description": "Complete API collection for managing the trading bot",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Pause Trading",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"action\": \"pause\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/pause_trading",
+          "protocol": "http",
+          "host": ["127.0.0.1"],
+          "port": "5000",
+          "path": ["pause_trading"]
+        }
+      }
+    },
+    {
+      "name": "Resume Trading",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"action\": \"resume\"\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/pause_trading",
+          "protocol": "http",
+          "host": ["127.0.0.1"],
+          "port": "5000",
+          "path": ["pause_trading"]
+        }
+      }
+    },
+    {
+      "name": "Place Live Trade",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"symbol\": \"BTCUSDT\",\n  \"side\": \"BUY\",\n  \"amount\": 0.001,\n  \"use_quote\": false\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/live_trade",
+          "protocol": "http",
+          "host": ["127.0.0.1"],
+          "port": "5000",
+          "path": ["live_trade"]
+        }
+      }
+    },
+    {
+      "name": "Update Trailing Configs",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mode\": \"multi-step\",\n  \"arm_trigger\": 0.02,\n  \"steps\": [\n    {\"trigger\": 0.03, \"trail\": 0.015},\n    {\"trigger\": 0.06, \"trail\": 0.025}\n  ],\n  \"breakeven_trigger\": 0.02,\n  \"take_profit_ladder\": [\n    {\"trigger\": 0.03, \"percent\": 0.25},\n    {\"trigger\": 0.06, \"percent\": 0.25},\n    {\"trigger\": 0.10, \"percent\": 0.50}\n  ],\n  \"daily_profit_target\": 0.05\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/trailing-configs",
+          "protocol": "http",
+          "host": ["127.0.0.1"],
+          "port": "5000",
+          "path": ["trailing-configs"]
+        }
+      }
+    },
+    {
+      "name": "Get Trailing Configs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/trailing-configs",
+          "protocol": "http",
+          "host": ["127.0.0.1"],
+          "port": "5000",
+          "path": ["trailing-configs"]
+        }
+      }
+    },
+    {
+      "name": "Cancel Order",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"symbol\": \"BTCUSDT\",\n  \"orderId\": 123456789\n}"
+        },
+        "url": {
+          "raw": "http://127.0.0.1:5000/order_cancel",
+          "protocol": "http",
+          "host": ["127.0.0.1"],
+          "port": "5000",
+          "path": ["order_cancel"]
+        }
+      }
+    },
+    {
+      "name": "Get Status",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:5000/status",
+          "protocol": "http",
+          "host": ["127.0.0.1"],
+          "port": "5000",
+          "path": ["status"]
+        }
+      }
+    }
+  ]
+}

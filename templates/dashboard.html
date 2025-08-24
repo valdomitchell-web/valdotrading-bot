@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Trading Dashboard</title>
+  <meta charset="utf-8" />
+  <style>
+    body { background: skyblue; font-family: Arial, sans-serif; padding: 20px; }
+    h1, h2 { text-align: center; }
+    .cards { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin: 10px 0 20px; }
+    .card { background: #fff; padding: 14px 18px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); min-width: 220px; }
+    table { width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; }
+    th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+    th { background-color: #007acc; color: white; }
+    .toolbar { text-align: right; margin: 6px 0 12px; }
+    .toolbar form { display: inline; }
+    button { padding: 8px 12px; border: 0; border-radius: 6px; background: #007acc; color:#fff; cursor:pointer; }
+    button:hover { background:#0169aa; }
+    .btn-outline-danger { background:#fff; color:#c1121f; border:1px solid #c1121f; }
+    .btn-outline-danger:hover { background:#c1121f; color:#fff; }
+
+    /* Ensure sync controls text always visible */
+    #syncControls * {
+      font-size: 14px !important;
+      line-height: 1.2 !important;
+      color: #111 !important;
+      text-transform: none !important;
+      letter-spacing: normal !important;
+    }
+    @media (prefers-color-scheme: dark) {
+      #syncControls * { color: #f5f5f5 !important; }
+      #btnSyncNow { background: #1f2937 !important; border-color: #374151 !important; }
+    }
+    #btnSyncNow {
+      all: revert;
+      appearance: button;
+      padding: 6px 10px !important;
+      border: 1px solid #ddd !important;
+      background: #f8f8f8 !important;
+      border-radius: 6px !important;
+      cursor: pointer !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+    }
+    #btnSyncNow span, #autoSyncLabel {
+      display: inline-block !important;
+      visibility: visible !important;
+      opacity: 1 !important;
+    }
+    #syncControls button, #syncControls label {
+      text-indent: 0 !important;
+      overflow: visible !important;
+      white-space: nowrap !important;
+    }
+    td:nth-last-child(1) div { line-height: 1.25; }
+    td:nth-last-child(1) b { display:inline-block; min-width: 82px; }
+  </style>
+</head>
+<body>
+  <h1>Trading Dashboard</h1>
+
+  <div class="toolbar">
+    <a href="/logout"><button type="button">Logout</button></a>
+  </div>
+
+  <!-- Sync controls -->
+  <div id="syncControls" style="display:flex;align-items:center;gap:12px;margin:10px 0;">
+    <button id="btnSyncNow" type="button" aria-label="Sync Open Orders">
+      <span>Sync Open Orders</span>
+    </button>
+
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+      <input id="chkAutoSync" type="checkbox" />
+      <span>Auto-sync: <strong id="autoSyncLabel">OFF</strong></span>
+    </label>
+
+    <span id="syncDot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#aaa;"></span>
+    <span id="syncMsg" style="color:#666;font-size:0.9em;"></span>
+  </div>
+
+  <div class="cards">
+    <div class="card"><b>Realized PnL:</b> {{ '%.2f' % pnl_realized }}</div>
+    <div class="card"><b>Unrealized PnL:</b> {{ '%.2f' % pnl_unrealized }}</div>
+    <div class="card"><b>Open Positions:</b> {{ positions_open|length }}</div>
+    <div class="card"><b>Open Orders:</b> {{ orders_open|length }}</div>
+  </div>
+
+  <!-- Open Positions -->
+  <h2>Open Positions</h2>
+  {% if positions_open %}
+  <table>
+    <tr>
+      <th>ID</th>
+      <th>Symbol</th>
+      <th>Side</th>
+      <th>Qty</th>
+      <th>Avg Price</th>
+      <th>Opened</th>
+      <th>Actions</th>
+      <th>Trailing</th>
+      <th>Trailing Status</th>
+    </tr>
+    {% for p in positions_open %}
+    <tr>
+      <td>{{ p.id }}</td>
+      <td>{{ p.symbol }}</td>
+      <td>{{ p.side }}</td>
+      <td>{{ '%.8f' % (p.qty or 0) }}</td>
+      <td>{{ '%.2f' % (p.avg_price or 0) }}</td>
+      <td>{{ p.opened_at }}</td>
+
+      <!-- Actions -->
+      <td>
+        <div style="display:flex; gap:6px;">
+          <button class="close-btn" data-symbol="{{ p.symbol }}" data-percent="50">Close 50%</button>
+          <button class="close-btn" data-symbol="{{ p.symbol }}" data-percent="100">Close 100%</button>
+        </div>
+      </td>
+
+      <!-- Trailing controls -->
+      <td>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button class="trail-on" data-symbol="{{ p.symbol }}" data-trail="0.01" data-arm="0.005"
+                  title="Enable trailing: 1% trail, 0.5% arm">Trail 1% / Arm 0.5%</button>
+          <button class="trail-off" data-symbol="{{ p.symbol }}" title="Disable trailing">Disable</button>
+        </div>
+      </td>
+
+      <!-- Trailing Status -->
+      <td id="trail-{{ p.symbol }}">
+        {% set cfg = trailing_cfg.get(p.symbol) %}
+        {% if cfg %}
+          <div><b>Active:</b> {{ 'ON' if cfg.active else 'OFF' }}</div>
+          <div><b>Armed:</b> {{ 'Yes' if cfg.armed else 'No' }}</div>
+          <div><b>High:</b> {{ '%.2f' % (cfg.high_water or 0) }}</div>
+          <div><b>Trail%:</b> {{ '%.2f' % ((cfg.trail_pct or 0) * 100) }}%</div>
+          <div><b>Stop now:</b>
+            {% if cfg.armed and cfg.high_water %}
+              {{ '%.2f' % (cfg.high_water * (1 - (cfg.trail_pct or 0))) }}
+            {% else %}-{% endif %}
+          </div>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+    <p>No open positions.</p>
+  {% endif %}
+
+  <!-- Open Orders -->
+  <h2>Open Orders</h2>
+  {% if orders_open %}
+  <table>
+    <tr>
+      <th>ID</th><th>Symbol</th><th>Side</th><th>Type</th><th>Status</th><th>Qty</th><th>Price</th><th>Stop</th><th>Actions</th>
+    </tr>
+    {% for o in orders_open %}
+    <tr>
+      <td>{{ o.binance_id }}</td>
+      <td>{{ o.symbol }}</td>
+      <td>{{ o.side }}</td>
+      <td>{{ o.type }}</td>
+      <td>{{ o.status }}</td>
+      <td>{{ "%.8f"|format(o.qty or 0.0) }}</td>
+      <td>{{ o.price }}</td>
+      <td>{{ o.stop_price }}</td>
+      <td>
+        <button
+          class="btn btn-sm btn-outline-danger cancel-btn"
+          data-symbol="{{ o.symbol }}"
+          data-binance-id="{{ o.binance_id }}"
+          title="Cancel order on Binance"
+        >Cancel</button>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+    <p>No open orders.</p>
+  {% endif %}
+
+  <!-- Closed Positions -->
+  <h2>Closed Positions (last 50)</h2>
+  {% if positions_closed %}
+  <table>
+    <tr><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Closed</th><th>Realized PnL</th></tr>
+    {% for p in positions_closed %}
+    <tr>
+      <td>{{ p.id }}</td>
+      <td>{{ p.symbol }}</td>
+      <td>{{ p.side }}</td>
+      <td>{{ '%.8f' % (p.qty or 0) }}</td>
+      <td>{{ '%.2f' % (p.avg_price or 0) }}</td>
+      <td>{{ p.closed_at }}</td>
+      <td>{{ '%.2f' % (p.realized_pnl or 0) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+    <p>No closed positions yet.</p>
+  {% endif %}
+
+ <!-- Trade History -->
+<h2>Trade History (last 50)</h2>
+{% if trades %}
+<table>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Symbol</th>
+      <th>Side</th>
+      <th>Amount</th>
+      <th>Price</th>
+      <th>Time</th>
+      <th>Source</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in trades %}
+    <tr>
+      <td>{{ t.id }}</td>
+      <td>{{ t.symbol }}</td>
+      <td>{{ t.side }}</td>
+      <td>{{ t.amount }}</td>
+      <td>{{ t.price }}</td>
+      <td>{{ t.timestamp }}</td>
+      <td>
+        <span class="badge {{ 'bg-green' if (t.source=='webhook') else 'bg-gray' }}">
+          {{ t.source or '—' }}
+        </span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+  <p>No trades recorded.</p>
+{% endif %}
+
+<style>
+  .badge{padding:.15rem .4rem;border-radius:.5rem;font-size:.75rem}
+  .bg-green{background:#e6ffed;color:#046d37}
+  .bg-gray{background:#eee;color:#333}
+</style>
+
+
+  <!-- Scripts -->
+  <script>
+    // --- Helpers ---
+    async function postJSON(url, body) {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body || {})
+      });
+      let j = {};
+      try { j = await r.json(); } catch (e) {}
+      if (!r.ok) throw new Error(j.error || 'Request failed');
+      return j;
+    }
+    function showToast(message, color) {
+      var toast = document.createElement("div");
+      toast.textContent = message;
+      toast.style.position = "fixed";
+      toast.style.right = "20px";
+      toast.style.bottom = "20px";
+      toast.style.background = color || "#28a745";
+      toast.style.color = "#fff";
+      toast.style.padding = "10px 14px";
+      toast.style.borderRadius = "8px";
+      toast.style.boxShadow = "0 6px 18px rgba(0,0,0,.2)";
+      toast.style.zIndex = "9999";
+      toast.style.fontFamily = "system-ui, sans-serif";
+      document.body.appendChild(toast);
+      setTimeout(function(){ toast.remove(); }, 4200);
+    }
+
+    // --- Sync controls UI ---
+    async function refreshSyncUI() {
+      try {
+        const r = await fetch('/sync_status');
+        const j = await r.json();
+
+        const chk = document.getElementById('chkAutoSync');
+        const lbl = document.getElementById('autoSyncLabel');
+        chk.checked = !!j.enabled;
+        lbl.textContent = j.enabled ? 'ON' : 'OFF';
+
+        const dot = document.getElementById('syncDot');
+        if (j.enabled) {
+          dot.style.background = (j.last_ok === false) ? '#e11d48' : '#22c55e';
+          dot.animate([{opacity:1},{opacity:0.4},{opacity:1}], {duration:900, iterations:1});
+        } else {
+          dot.style.background = '#aaa';
+        }
+
+        const msg = document.getElementById('syncMsg');
+        if (j.last_at) {
+          const when = new Date(j.last_at);
+          msg.textContent = `Last sync: ${when.toLocaleTimeString()}` + (j.last_error ? ` – ${j.last_error}` : '');
+        } else {
+          msg.textContent = '';
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    async function doManualSync() {
+      const btn = document.getElementById('btnSyncNow');
+      const msg = document.getElementById('syncMsg');
+      btn.disabled = true; btn.querySelector('span').textContent = 'Syncing…';
+      try {
+        const j = await postJSON('/sync_open', {});
+        if (j.ok) {
+          msg.textContent = `Synced ${j.open_orders_seen} open orders` + (j.symbols_refreshed?.length ? ` · ${j.symbols_refreshed.join(',')}` : '');
+        } else {
+          msg.textContent = `Sync error: ${j.error || 'Unknown'}`;
+        }
+      } catch (e) {
+        msg.textContent = `Sync error: ${e.message || e}`;
+      } finally {
+        btn.disabled = false; btn.querySelector('span').textContent = 'Sync Open Orders';
+        refreshSyncUI();
+        setTimeout(() => { window.location.reload(); }, 600);
+      }
+    }
+
+    async function toggleAutoSync(ev) {
+      const enabled = ev.target.checked;
+      try {
+        await postJSON('/sync_toggle', { enabled });
+      } catch (e) {
+        ev.target.checked = !enabled; // revert on error
+      } finally {
+        refreshSyncUI();
+      }
+    }
+
+    document.getElementById('btnSyncNow').addEventListener('click', (e) => { e.preventDefault(); doManualSync(); });
+    document.getElementById('chkAutoSync').addEventListener('change', toggleAutoSync);
+    setInterval(refreshSyncUI, 1500);
+    refreshSyncUI();
+
+    // --- Cancel order buttons (inside Open Orders table) ---
+    document.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.cancel-btn');
+      if (!btn) return;
+      const symbol = btn.dataset.symbol;
+      const binance_id = btn.dataset.binanceId; // maps from data-binance-id
+
+      btn.disabled = true; const old = btn.textContent; btn.textContent = 'Canceling…';
+      try {
+        await postJSON('/order_cancel', { symbol, binance_id });
+        showToast('Order canceled', '#dc3545');
+        await postJSON('/sync_open', { symbol });
+        location.reload();
+      } catch (err) {
+        console.error(err);
+        showToast('Cancel failed: ' + err.message, '#dc3545');
+      } finally {
+        btn.disabled = false; btn.textContent = old;
+      }
+    });
+
+    // --- Close % buttons (inside Open Positions table) ---
+    document.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.close-btn');
+      if (!btn) return;
+      const symbol = btn.dataset.symbol;
+      const percent = Number(btn.dataset.percent || 100);
+      btn.disabled = true; const old = btn.textContent; btn.textContent = 'Closing…';
+      try {
+        await postJSON('/position_close', { symbol, percent });
+        showToast(`Closed ${percent}% of ${symbol}`, '#0d6efd');
+        await postJSON('/sync_open', { symbol });
+        location.reload();
+      } catch (err) {
+        console.error(err);
+        showToast('Close failed: ' + err.message, '#dc3545');
+      } finally {
+        btn.disabled = false; btn.textContent = old;
+      }
+    });
+
+    // --- SSE: live events + tiny status dot in header ---
+    (function () {
+      var hdr = document.querySelector("header") || document.body;
+      var liveDot = document.createElement("span");
+      liveDot.id = "autoSyncDot";
+      liveDot.title = "SSE connection status";
+      liveDot.style.cssText = "display:inline-block;width:10px;height:10px;border-radius:50%;background:#aaa;margin-left:8px;vertical-align:middle;box-shadow:0 0 0 rgba(0,0,0,0);";
+      var label = document.createElement("span");
+      label.textContent = " Live";
+      label.style.marginLeft = "6px";
+      hdr.appendChild(liveDot);
+      hdr.appendChild(label);
+
+      function setDot(ok) {
+        liveDot.style.background = ok ? "#20c997" : "#dc3545";
+        liveDot.style.boxShadow = ok ? "0 0 0 0 rgba(32,201,151,.7)" : "none";
+        if (ok) {
+          liveDot.animate(
+            [{boxShadow:"0 0 0 0 rgba(32,201,151,.7)"},{boxShadow:"0 0 0 8px rgba(32,201,151,0)"}],
+            {duration: 1100}
+          );
+        }
+      }
+
+      try {
+        var es = new EventSource("/events");
+        var lastBeat = Date.now();
+
+        es.addEventListener("hello", function(){ setDot(true); });
+        es.addEventListener("heartbeat", function(){ setDot(true); lastBeat = Date.now(); });
+
+        es.addEventListener("entry_filled", function(e) {
+          var data = JSON.parse(e.data);
+          showToast("Bought " + data.qty + " " + data.symbol + " @" + Number(data.price).toFixed(2), "#20c997");
+          setDot(true);
+        });
+
+        es.addEventListener("oco_attached", function(e) {
+          var data = JSON.parse(e.data);
+          showToast("OCO attached for " + data.symbol, "#6f42c1");
+          setDot(true);
+        });
+
+        es.addEventListener("position_auto_closed", function(e) {
+          var data = JSON.parse(e.data);
+          showToast("Auto-closed " + data.symbol + " | PnL: " + Number(data.realized_pnl || 0).toFixed(2), "#198754");
+          setDot(true);
+        });
+
+        es.onerror = function(){ setDot(false); };
+        setInterval(function(){ if (Date.now() - lastBeat > 45000) setDot(false); }, 5000);
+      } catch (err) {
+        console.error("SSE error", err);
+        setDot(false);
+      }
+    })();
+
+    // --- Trailing enable/disable buttons ---
+    async function setTrail(symbol, active, trail_pct, arm_pct) {
+      const body = { symbol, active };
+      if (trail_pct !== undefined) body.trail_pct = trail_pct;
+      if (arm_pct !== undefined) body.arm_pct = arm_pct;
+      const r = await fetch('/trail/set', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'trail/set failed');
+      return j;
+    }
+
+    document.addEventListener('click', async (e) => {
+      const on = e.target.closest('.trail-on');
+      if (on) {
+        const symbol = on.dataset.symbol;
+        const trail = Number(on.dataset.trail || 0.01);
+        const arm = Number(on.dataset.arm || 0.005);
+        on.disabled = true; const old = on.textContent; on.textContent = 'Enabling…';
+        try {
+          await setTrail(symbol, true, trail, arm);
+          showToast(`Trailing enabled for ${symbol} (${(trail*100).toFixed(2)}% / arm ${(arm*100).toFixed(2)}%)`, '#6f42c1');
+        } catch (err) {
+          showToast('Trail failed: ' + err.message, '#dc3545');
+        } finally {
+          on.disabled = false; on.textContent = old;
+        }
+      }
+
+      const off = e.target.closest('.trail-off');
+      if (off) {
+        const symbol = off.dataset.symbol;
+        off.disabled = true; const old = off.textContent; off.textContent = 'Disabling…';
+        try {
+          await setTrail(symbol, false);
+          showToast(`Trailing disabled for ${symbol}`, '#6c757d');
+        } catch (err) {
+          showToast('Disable failed: ' + err.message, '#dc3545');
+        } finally {
+          off.disabled = false; off.textContent = old;
+        }
+      }
+    });
+
+    // --- Live poll trailing status to keep the “Trailing Status” column fresh ---
+    (function(){
+      function renderTrailCell(symbol, data) {
+        const el = document.getElementById('trail-' + symbol);
+        if (!el) return;
+        const pct = (v) => (typeof v === 'number' ? (v * 100).toFixed(2) + '%' : '0.00%');
+        const num = (v, d=2) => (typeof v === 'number' ? v.toFixed(d) : '-');
+
+        el.innerHTML = `
+          <div><b>Active:</b> ${data.active ? 'ON' : 'OFF'}</div>
+          <div><b>Armed:</b> ${data.armed ? 'Yes' : 'No'}</div>
+          <div><b>High:</b> ${num(data.high_water)}</div>
+          <div><b>Trail%:</b> ${pct(data.trail_pct || 0)}</div>
+          <div><b>Stop now:</b> ${data.stop_now != null ? num(data.stop_now) : '-'}</div>
+        `;
+      }
+
+      async function pollTrailStatus() {
+        try {
+          const r = await fetch('/trail/status', { cache: 'no-store' });
+          if (!r.ok) return;
+          const j = await r.json();
+          // unified route from app.py returns: { ok: true, rows: [...] }
+          if (!j.ok || !Array.isArray(j.rows)) return;
+          j.rows.forEach(row => {
+            renderTrailCell(row.symbol, row);
+          });
+        } catch(e) { /* ignore */ }
+      }
+
+      pollTrailStatus();
+      setInterval(pollTrailStatus, 2000);
+    })();
+  </script>
+</body>
+</html>

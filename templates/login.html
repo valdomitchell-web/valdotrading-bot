@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Login</title>
+  <style>
+    body { background: skyblue; font-family: Arial, sans-serif; padding: 50px; }
+    form { max-width: 340px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 10px; }
+    input, button { width: 100%; padding: 10px; margin: 8px 0; }
+    .err { color: #b00020; text-align: center; }
+  </style>
+</head>
+<body>
+  <form method="post">
+    <h2>Login</h2>
+    <input name="username" placeholder="Username" required>
+    <input name="password" type="password" placeholder="Password" required>
+    <button type="submit">Login</button>
+    {% if error %}<p class="err">{{ error }}</p>{% endif %}
+    <p style="text-align:center">No account? Ask admin to create one.</p>
+  </form>
+</body>
+</html>
+

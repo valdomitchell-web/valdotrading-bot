@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: trading-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers=2 --threads=4 --timeout=120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bot-db
+          property: connectionString
+    healthCheckPath: /sync_status
+databases:
+  - name: bot-db
+    plan: free
