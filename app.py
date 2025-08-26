@@ -1623,6 +1623,145 @@ def dashboard():
         trailing_cfg=load_trailing_cfg_dict()
     )
 
+# === AUTO TRADER (EMA + RSI) & DEBUG TEST BUY ===============================
+import threading, time, math
+from datetime import datetime
+from flask import jsonify, request
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+AUTO = {"enabled": False, "thread": None, "last": None, "err": None}
+
+def _bn_client():
+    use_us  = os.getenv("BINANCE_US","false").lower()=="true"
+    testnet = os.getenv("BINANCE_TESTNET","false").lower()=="true"
+    return Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_API_SECRET"),
+                  tld=("us" if use_us else "com"), testnet=testnet)
+
+def _ema(vals, n):
+    k = 2/(n+1); e = vals[0]
+    for v in vals[1:]: e = v*k + e*(1-k)
+    return e
+
+def _rsi(vals, n=14):
+    ups, dns = [], []
+    for i in range(1, len(vals)):
+        d = vals[i]-vals[i-1]
+        ups.append(max(d,0.0)); dns.append(max(-d,0.0))
+    if len(ups) < n: return 50.0
+    au = sum(ups[-n:])/n; ad = sum(dns[-n:])/n
+    if ad == 0: return 100.0
+    rs = au/ad
+    return 100 - 100/(1+rs)
+
+def _have_open(symbol):
+    try:
+        return db.session.query(Position).filter_by(symbol=symbol, is_open=True).count() > 0
+    except Exception:
+        return False
+
+def _strategy_step():
+    sym = os.getenv("TRADE_SYMBOLS","BTCUSDT").split(",")[0].strip().upper()
+    c = _bn_client()
+    kl = c.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1MINUTE, limit=100)
+    closes = [float(k[4]) for k in kl]
+    if len(closes) < 30: return
+
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    rsi14 = _rsi(closes, 14)
+    price = closes[-1]
+
+    if _have_open(sym):
+        return
+
+    if ema12 > ema26 and rsi14 < 60:
+        info = c.get_symbol_info(sym)
+        step = 0.001
+        for f in info.get("filters", []):
+            if f.get("filterType") == "LOT_SIZE":
+                step = float(f["stepSize"]); break
+        qty = math.floor((20.0/price)/step)*step  # ~$20 notional for testing
+        if qty <= 0: return
+
+        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
+
+        try:
+            db.session.add(Trade(
+                symbol=sym, side="BUY", amount=qty, price=price,
+                timestamp=datetime.utcnow(), is_open=False, source="auto"
+            ))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+def _auto_loop():
+    while True:
+        try:
+            if AUTO["enabled"]:
+                _strategy_step()
+                AUTO["last"] = datetime.utcnow().isoformat()
+                AUTO["err"] = None
+        except Exception as e:
+            AUTO["err"] = str(e)
+        time.sleep(60)
+
+def _ensure_thread():
+    if AUTO["thread"] is None or not AUTO["thread"].is_alive():
+        t = threading.Thread(target=_auto_loop, name="auto_loop", daemon=True)
+        t.start()
+        AUTO["thread"] = t
+
+@app.route("/auto/start", methods=["POST"])
+def auto_start():
+    if not session.get("user_id") and not session.get("logged_in"):
+        return jsonify(ok=False, error="auth"), 401
+    AUTO["enabled"] = True
+    _ensure_thread()
+    return jsonify(ok=True, enabled=True)
+
+@app.route("/auto/stop", methods=["POST"])
+def auto_stop():
+    if not session.get("user_id") and not session.get("logged_in"):
+        return jsonify(ok=False, error="auth"), 401
+    AUTO["enabled"] = False
+    return jsonify(ok=True, enabled=False)
+
+@app.route("/auto/status", methods=["GET"])
+def auto_status():
+    return jsonify(ok=True, enabled=AUTO["enabled"],
+                   last=AUTO["last"], err=AUTO["err"],
+                   running=bool(AUTO["thread"] and AUTO["thread"].is_alive()))
+
+@app.route("/debug/test_buy", methods=["POST"])
+def debug_test_buy():
+    if not session.get("user_id") and not session.get("logged_in"):
+        return jsonify(ok=False, error="auth"), 401
+    if os.getenv("BINANCE_TESTNET","false").lower() != "true":
+        return jsonify(ok=False, error="not testnet"), 400
+
+    data = request.get_json(silent=True) or {}
+    sym  = (data.get("symbol") or "BTCUSDT").upper()
+    usdt = float(data.get("usdt") or 20)
+
+    c = _bn_client()
+    price = float(c.get_symbol_ticker(symbol=sym)["price"])
+    info  = c.get_symbol_info(sym)
+    step = 0.001
+    for f in info.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            step = float(f["stepSize"]); break
+    qty = math.floor((usdt/price)/step)*step
+    if qty <= 0:
+        return jsonify(ok=False, error="qty too small"), 400
+    try:
+        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
+        return jsonify(ok=True, status=o.get("status"), qty=qty)
+    except BinanceAPIException as e:
+        return jsonify(ok=False, error=str(e)), 400
+# ============================================================================
+// end patch
+
 # ============== Paper trading monitor (unchanged) ==============
 def monitor_trades():
     with app.app_context():
