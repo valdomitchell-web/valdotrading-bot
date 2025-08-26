@@ -1756,7 +1756,7 @@ def debug_test_buy():
     except BinanceAPIException as e:
         return jsonify(ok=False, error=str(e)), 400
 # ============================================================================
-// end patch
+# end patch
 
 # ============== Paper trading monitor (unchanged) ==============
 def monitor_trades():
