@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+import math
 import json
 import os
 import queue
@@ -20,6 +21,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from werkzeug.security import generate_password_hash
+
 
 # =========================
 # Load env & Flask config
@@ -1623,11 +1625,6 @@ def dashboard():
     )
 
 # === AUTO TRADER (EMA + RSI) & DEBUG TEST BUY ===============================
-import threading, time, math
-from datetime import datetime
-from flask import jsonify, request
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
 
 AUTO = {"enabled": False, "thread": None, "last": None, "err": None}
 
