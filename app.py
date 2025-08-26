@@ -39,7 +39,6 @@ TRADINGVIEW_WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET")
 def healthz():
     return "ok", 200
 
-
 # =========================
 # Feature flags & defaults
 # =========================
