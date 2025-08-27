@@ -490,15 +490,24 @@ def auto_loop():
                 # BUY: EMA fast cross up, RSI below cap, and not already holding significant base
                 if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price_live < min_notional:
                     qty_raw = AUTO_RISK_USDT / price_live
-                    qty = round_step(qty_raw, lot_step)
-                    if qty * price_live >= min_notional and qty > 0:
-                        o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
-                        record_trade_ts(sym)
-                        filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
-                        avg_price = (
-                            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-                            if o.get("fills") else price_live
-                        )
+                    # BUY …
+qty = round_step(qty_raw, lot_step)
+if qty * price >= min_notional and qty > 0:
+    # format quantity to the LOT_SIZE step as a plain string
+    info = client.get_symbol_info(sym)
+    step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+    qty_str = qty_to_str(qty, step_str)
+
+    o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
+    record_trade_ts(sym)
+
+    filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
+    avg_price = (
+        sum(float(f["price"]) * float(f["qty"]) for f in o.get("fills", [])) / filled_qty
+        if o.get("fills") else price
+    )
+
+                
                         # persist to DB for dashboard
                         try:
                             db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
@@ -510,15 +519,21 @@ def auto_loop():
 
                 # SELL: EMA fast cross down, RSI above floor, and we hold base
                 elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price_live >= min_notional:
-                    qty = round_step(base_bal, lot_step)
-                    if qty * price_live >= min_notional and qty > 0:
-                        o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty)
-                        record_trade_ts(sym)
-                        filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
-                        avg_price = (
-                            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-                            if o.get("fills") else price_live
-                        )
+qty = round_step(base_bal, lot_step)
+if qty * price >= min_notional and qty > 0:
+    info = client.get_symbol_info(sym)
+    step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+    qty_str = qty_to_str(qty, step_str)
+
+    o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty_str)
+    record_trade_ts(sym)
+
+    filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
+    avg_price = (
+        sum(float(f["price"]) * float(f["qty"]) for f in o.get("fills", [])) / filled_qty
+        if o.get("fills") else price
+    )
+
                         try:
                             db.session.add(Trade(symbol=sym, side="SELL", amount=filled_qty, price=avg_price,
                                                  timestamp=datetime.utcnow(), is_open=False, source="auto"))
@@ -618,38 +633,57 @@ def debug_live_buy():
 
     data = request.get_json(silent=True) or {}
     sym  = (data.get("symbol") or "BTCUSDT").upper()
-    usdt = float(data.get("usdt") or 10)  # default ~ $10
+    usdt = float(data.get("usdt") or 10)
 
     try:
         c = make_client()
         price = float(c.get_symbol_ticker(symbol=sym)["price"])
-        lot_step, min_notional = symbol_filters(c, sym)
-        qty = round_step(usdt / price, lot_step)
-        if qty <= 0 or qty * price < min_notional:
+
+        info = c.get_symbol_info(sym)
+        step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+        # find min notional
+        min_notional = 5.0
+        for f in info["filters"]:
+            if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
+                mn = f.get("minNotional") or f.get("minNotional")
+                if mn is not None:
+                    min_notional = float(mn)
+
+        # raw qty, then quantize + stringify
+        qty_raw = Decimal(str(usdt)) / Decimal(str(price))
+        qty_str = qty_to_str(qty_raw, step_str)
+
+        if (Decimal(qty_str) * Decimal(str(price))) < Decimal(str(min_notional)) or Decimal(qty_str) <= 0:
             return jsonify(ok=False, error=f"qty too small (minNotional≈{min_notional})"), 400
 
-        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
-        filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
+        # pass STRING quantity to Binance
+        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
+
+        filled_qty = sum(Decimal(f["qty"]) for f in o.get("fills", [])) if o.get("fills") else Decimal(qty_str)
         avg_price = (
-            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-            if o.get("fills") else price
+            (sum(Decimal(f["price"]) * Decimal(f["qty"]) for f in o.get("fills", [])) / filled_qty)
+            if o.get("fills") else Decimal(str(price))
         )
 
-        # persist to DB so dashboard can show it
+        # persist to DB for dashboard
         try:
-            db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
-                                 timestamp=datetime.utcnow(), is_open=False, source="live_debug"))
+            db.session.add(Trade(
+                symbol=sym, side="BUY",
+                amount=float(filled_qty), price=float(avg_price),
+                timestamp=datetime.utcnow(), is_open=False, source="live_debug"
+            ))
             db.session.commit()
         except Exception:
             db.session.rollback()
 
-        app.logger.info("[DEBUG] LIVE BUY %s qty=%.8f @ %.2f", sym, filled_qty, avg_price)
-        return jsonify(ok=True, status=o.get("status"), qty=filled_qty, avg_price=avg_price)
+        app.logger.info("[DEBUG] LIVE BUY %s qty=%s @ %f", sym, str(filled_qty), float(avg_price))
+        return jsonify(ok=True, status=o.get("status"), qty=str(filled_qty), avg_price=float(avg_price))
     except BinanceAPIException as e:
         return jsonify(ok=False, error=str(e)), 400
     except Exception as e:
         app.logger.exception("live_buy exception")
         return jsonify(ok=False, error=str(e)), 500
+
 # ---------------------------------------------------------------------------
 # ============== Auth helpers ==============
 def is_authorized(req) -> bool:
@@ -685,6 +719,19 @@ def infer_source_from_request(req, default='manual'):
     ):
         return 'webhook'
     return default
+
+from decimal import Decimal, ROUND_DOWN
+
+def qty_to_str(qty, step_str: str) -> str:
+    """
+    Quantize qty to the LOT_SIZE step and return a plain string (no scientific notation).
+    """
+    q = Decimal(str(qty)).quantize(Decimal(step_str), rounding=ROUND_DOWN)
+    s = format(q, "f")  # '0.000183' instead of '1.83E-4'
+    # strip trailing zeros / dot (Binance accepts both, but this keeps it clean)
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
 
 
 # ============== Risk / guardrails ==============
@@ -1409,6 +1456,7 @@ def sync_status():
     })
 
 # ---- Single, unified trailing status route (remove duplicates) ----
+
 @app.route('/trail/status', methods=['GET'])
 def trail_status():
     if not is_authorized(request):
