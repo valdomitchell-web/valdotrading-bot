@@ -23,7 +23,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from werkzeug.security import generate_password_hash
 from secrets import token_urlsafe
-
+from threading import Event, Thread
 
 # =========================
 # Load env & Flask config
