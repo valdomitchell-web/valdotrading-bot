@@ -643,67 +643,6 @@ def debug_live_buy():
 
 # ====================== END AUTO TRADER (DROP-IN) ============================
 
-# --- LIVE TEST BUY (admin-protected) ----------------------------------------
-from flask import request, jsonify
-from datetime import datetime
-from decimal import Decimal
-from binance.exceptions import BinanceAPIException
-
-# uses your existing helpers: require_admin(), TESTNET, make_client(), symbol_filters, round_step
-
-@app.post("/debug/live_buy")
-def debug_live_buy():
-    if not require_admin():
-        return jsonify(ok=False, error="auth"), 401
-    if TESTNET:
-        return jsonify(ok=False, error="this route is for LIVE; use /debug/test_buy for testnet"), 400
-
-    data = request.get_json(silent=True) or {}
-    sym  = (data.get("symbol") or "BTCUSDT").upper()
-    usdt = float(data.get("usdt") or 11)
-
-    c = make_client()
-    info = c.get_symbol_info(sym)
-
-    # figure out minNotional
-    min_notional = 5.0
-    for f in info.get("filters", []):
-        if f.get("filterType") in ("NOTIONAL", "MIN_NOTIONAL"):
-            mn = f.get("minNotional") or f.get("notional")
-            if mn is not None:
-                min_notional = float(mn)
-                break
-
-    spend = max(usdt, min_notional)  # ensure >= minNotional
-
-    try:
-        # MARKET BUY by quote amount avoids LOT_SIZE issues
-        o = c.create_order(symbol=sym, side="BUY", type="MARKET",
-                           quoteOrderQty=f"{spend:.2f}")
-        return jsonify(ok=True, status=o.get("status"), cummulativeQuoteQty=o.get("cummulativeQuoteQty"))
-    except BinanceAPIException as e:
-        return jsonify(ok=False, error=str(e)), 400
-
-        # persist to DB for dashboard
-        try:
-            db.session.add(Trade(
-                symbol=sym, side="BUY",
-                amount=float(filled_qty), price=float(avg_price),
-                timestamp=datetime.utcnow(), is_open=False, source="live_debug"
-            ))
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-
-        app.logger.info("[DEBUG] LIVE BUY %s qty=%s @ %f", sym, str(filled_qty), float(avg_price))
-        return jsonify(ok=True, status=o.get("status"), qty=str(filled_qty), avg_price=float(avg_price))
-    except BinanceAPIException as e:
-        return jsonify(ok=False, error=str(e)), 400
-    except Exception as e:
-        app.logger.exception("live_buy exception")
-        return jsonify(ok=False, error=str(e)), 500
-
-# ---------------------------------------------------------------------------
 # ============== Auth helpers ==============
 def is_authorized(req) -> bool:
     # Existing API key path
