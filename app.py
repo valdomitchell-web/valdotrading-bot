@@ -336,30 +336,38 @@ def _bootstrap_db_once():
 _bootstrap_db_once()
 # --- end bootstrap ---
 
-# === Auto-trader config/helpers ===
-# If you haven’t added this helper yet:
-def env_true(name, default="false"):
-    return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
+# === AUTO TRADER (EMA + RSI) & DEBUG TEST BUY ===============================
+# Paste this whole block, replacing your existing auto-trader section.
 
-USE_US   = env_true("BINANCE_US", "false")
-TESTNET  = env_true("BINANCE_TESTNET", "false")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # set this in Render
-
-AUTO_SYMBOLS = [s.strip().upper() for s in os.getenv("AUTO_SYMBOLS", "BTCUSDT").split(",") if s.strip()]
-AUTO_INTERVAL = os.getenv("AUTO_INTERVAL", "5m")  # 1m/3m/5m/15m/1h…
-AUTO_RISK_USDT = float(os.getenv("AUTO_RISK_USDT", "20"))  # USDT per trade
-AUTO_COOLDOWN_SEC = int(os.getenv("AUTO_COOLDOWN_SEC", "300"))  # after any trade per symbol
-EMA_FAST = int(os.getenv("EMA_FAST", "9"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
-RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
-BUY_RSI_MAX  = float(os.getenv("BUY_RSI_MAX", "60"))  # require momentum not overbought
-SELL_RSI_MIN = float(os.getenv("SELL_RSI_MIN", "40"))  # avoid panic exits in chop
-
-# single-runner state
-_auto = {"thread": None, "stop": Event(), "enabled": False, "last": None, "err": None, "last_trade_ts": {}}
+import os, math, time
+from decimal import Decimal
+from datetime import datetime
+from threading import Event, Thread
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+
+# --- helpers & env (reuses your env_true) ---
+def env_true(name, default="false"):
+    return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
+
+USE_US      = env_true("BINANCE_US", "false")
+TESTNET     = env_true("BINANCE_TESTNET", "false")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # set this in Render
+
+AUTO_SYMBOLS       = [s.strip().upper() for s in os.getenv("AUTO_SYMBOLS", "BTCUSDT").split(",") if s.strip()]
+AUTO_INTERVAL      = os.getenv("AUTO_INTERVAL", "5m")      # 1m/3m/5m/15m/1h…
+AUTO_RISK_USDT     = float(os.getenv("AUTO_RISK_USDT", "20"))
+AUTO_COOLDOWN_SEC  = int(os.getenv("AUTO_COOLDOWN_SEC", "300"))
+EMA_FAST           = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW           = int(os.getenv("EMA_SLOW", "21"))
+RSI_LEN            = int(os.getenv("RSI_LEN", "14"))
+BUY_RSI_MAX        = float(os.getenv("BUY_RSI_MAX", "60"))  # buy only if RSI <= BUY_RSI_MAX
+SELL_RSI_MIN       = float(os.getenv("SELL_RSI_MIN", "40"))  # sell only if RSI >= SELL_RSI_MIN
+AUTO_VERBOSE       = env_true("AUTO_VERBOSE", "false")       # set true to log indicators each cycle
+
+# single-runner state
+_auto = {"thread": None, "stop": Event(), "enabled": False, "last": None, "err": None, "last_trade_ts": {}}
 
 def make_client():
     return Client(
@@ -374,12 +382,16 @@ def round_step(qty, step):
     return float((d // s) * s)
 
 def symbol_filters(client, symbol):
+    """Return (lot_step_decimal, min_notional_float)."""
     info = client.get_symbol_info(symbol)
     lot = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
     min_notional = None
     for f in info["filters"]:
         if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
-            min_notional = float(f.get("minNotional") or f.get("minNotional", 0))
+            # Both filters expose 'minNotional'
+            val = f.get("minNotional")
+            if val is not None:
+                min_notional = float(val)
     return Decimal(str(lot)), (min_notional or 5.0)
 
 def ema(series, n):
@@ -392,7 +404,8 @@ def ema(series, n):
 
 def rsi(closes, n=14):
     rsis=[None]*len(closes)
-    if len(closes) < n+1: return rsis
+    if len(closes) < n+1:
+        return rsis
     gains=0.0; losses=0.0
     for i in range(1, n+1):
         ch = closes[i]-closes[i-1]
@@ -431,7 +444,6 @@ def auto_loop():
     client = make_client()
     app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f USDT", AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
     try:
-        # cache filters
         flt = {s: symbol_filters(client, s) for s in AUTO_SYMBOLS}
     except Exception as e:
         _auto["err"] = f"filters: {e}"
@@ -447,35 +459,45 @@ def auto_loop():
 
                 kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
                 if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
+                    if AUTO_VERBOSE:
+                        app.logger.info("[AUTO] %s not enough klines (%d)", sym, len(kl) if kl else 0)
                     continue
 
                 closes, ef, es, r = last_close_and_indicators(kl)
-                p1, p2 = ef[-2], ef[-1]
-                q1, q2 = es[-2], es[-1]
+                price   = closes[-1]
+                p1, p2  = ef[-2], ef[-1]
+                q1, q2  = es[-2], es[-1]
                 rsi_now = r[-1] if r[-1] is not None else 50.0
 
                 bull_x = crossed_up(p1, p2, q1, q2)
                 bear_x = crossed_down(p1, p2, q1, q2)
 
+                if AUTO_VERBOSE:
+                    app.logger.info(
+                        "[AUTO] %s price=%.2f ema%d=%.2f→%.2f ema%d=%.2f→%.2f rsi%d=%.1f bull=%s bear=%s",
+                        sym, price, EMA_FAST, p1, p2, EMA_SLOW, q1, q2, RSI_LEN, rsi_now, bull_x, bear_x
+                    )
+
                 # balances
                 acct = client.get_account()
                 bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-                base = sym.replace("USDT","")
+                base = sym.replace("USDT", "")
                 base_bal = bals.get(base, 0.0)
-                price = float(client.get_symbol_ticker(symbol=sym)["price"])
+                # price could be slightly stale, but adequate for notional checks
+                price_live = float(client.get_symbol_ticker(symbol=sym)["price"])
                 lot_step, min_notional = flt[sym]
 
                 # BUY: EMA fast cross up, RSI below cap, and not already holding significant base
-                if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
-                    qty_raw = AUTO_RISK_USDT / price
+                if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price_live < min_notional:
+                    qty_raw = AUTO_RISK_USDT / price_live
                     qty = round_step(qty_raw, lot_step)
-                    if qty * price >= min_notional and qty > 0:
+                    if qty * price_live >= min_notional and qty > 0:
                         o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
                         record_trade_ts(sym)
                         filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
                         avg_price = (
                             sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-                            if o.get("fills") else price
+                            if o.get("fills") else price_live
                         )
                         # persist to DB for dashboard
                         try:
@@ -487,15 +509,15 @@ def auto_loop():
                         app.logger.info("[AUTO] BUY %s qty=%.8f @ %.2f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
 
                 # SELL: EMA fast cross down, RSI above floor, and we hold base
-                elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
+                elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price_live >= min_notional:
                     qty = round_step(base_bal, lot_step)
-                    if qty * price >= min_notional and qty > 0:
+                    if qty * price_live >= min_notional and qty > 0:
                         o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty)
                         record_trade_ts(sym)
                         filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
                         avg_price = (
                             sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-                            if o.get("fills") else price
+                            if o.get("fills") else price_live
                         )
                         try:
                             db.session.add(Trade(symbol=sym, side="SELL", amount=filled_qty, price=avg_price,
@@ -512,7 +534,7 @@ def auto_loop():
                 _auto["err"] = str(e)
                 app.logger.exception("[AUTO] %s exception", sym)
 
-        # small sleep (don’t hammer API). 30s is safe for 1m+ intervals.
+        # small sleep (don’t hammer API)
         _auto["stop"].wait(30)
 
     app.logger.info("[AUTO] stopped")
@@ -522,22 +544,24 @@ def require_admin():
     if session.get("logged_in") or session.get("user_id"):
         return True
     token = request.headers.get("X-Admin-Token")
-    return ADMIN_TOKEN and token == ADMIN_TOKEN
+    return bool(ADMIN_TOKEN) and token == ADMIN_TOKEN
 
 @app.get("/auto/status")
 def auto_status():
-    return jsonify(ok=True, running=(_auto["thread"] and _auto["thread"].is_alive()),
-                   enabled=_auto["enabled"], last=_auto["last"], err=_auto["err"])
+    return jsonify(ok=True,
+                   running=bool(_auto["thread"] and _auto["thread"].is_alive()),
+                   enabled=_auto["enabled"],
+                   last=_auto["last"],
+                   err=_auto["err"])
 
 @app.post("/auto/start")
 def auto_start():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
+    _auto["enabled"] = True
     if _auto["thread"] and _auto["thread"].is_alive():
-        _auto["enabled"] = True
         return jsonify(ok=True, running=True)
     _auto["stop"].clear()
-    _auto["enabled"] = True
     th = Thread(target=auto_loop, daemon=True)
     _auto["thread"] = th
     th.start()
@@ -575,6 +599,7 @@ def debug_test_buy():
         return jsonify(ok=True, status=o.get("status"), qty=qty)
     except BinanceAPIException as e:
         return jsonify(ok=False, error=str(e)), 400
+# === END AUTO TRADER =========================================================
 
 # ============== Auth helpers ==============
 def is_authorized(req) -> bool:
