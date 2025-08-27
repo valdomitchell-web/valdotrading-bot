@@ -26,7 +26,7 @@ from werkzeug.security import generate_password_hash
 # =========================
 # Load env & Flask config
 # =========================
-load_dotenv()
+#load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-fallback')
@@ -34,6 +34,33 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')  # e.g. postgr
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+load_dotenv(override=False)  # don't override Render env vars with .env
+
+def env_true(name, default="false"):
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+
+app.config["USE_US"]  = env_true("BINANCE_US")          # False => .com, True => .us
+app.config["TESTNET"] = env_true("BINANCE_TESTNET")     # True => testnet
+
+@app.get("/debug/env")
+def debug_env():
+    return jsonify(
+        ok=True,
+        tld=("us" if app.config["USE_US"] else "com"),
+        testnet=app.config["TESTNET"],
+        raw_BINANCE_US=os.getenv("BINANCE_US"),
+        raw_BINANCE_TESTNET=os.getenv("BINANCE_TESTNET"),
+    )
+
+# optional helper used wherever you build the Binance client
+def make_client():
+    return Client(
+        os.getenv("BINANCE_API_KEY"),
+        os.getenv("BINANCE_API_SECRET"),
+        tld=("us" if app.config["USE_US"] else "com"),
+        testnet=app.config["TESTNET"],
+    )
+    
 # Shared secret for TradingView (or any webhook caller)
 TRADINGVIEW_WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET")
 
@@ -84,8 +111,8 @@ NOTIFY_URL = os.getenv("NOTIFY_URL")  # e.g. https://hooks.example/abc123
 # Binance client
 # =========================
 def get_binance_client() -> Client:
-    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, tld=BINANCE_TLD, testnet=IS_TESTNET)
-    try:
+    c = make_client()
+try:
         server_time = client.get_server_time()["serverTime"]  # ms
         local_ms = int(time.time() * 1000)
         client.TIME_OFFSET = server_time - local_ms
@@ -1089,6 +1116,78 @@ def admin_bootstrap():
         db.session.rollback()
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/sync_trades", methods=["POST"])
+def sync_trades():
+    # Are we being called from fetch()?
+    is_fetch = request.headers.get("X-Requested-With") == "fetch"
+
+    # Require login
+    authed = session.get("user_id") or session.get("logged_in")
+    if not authed:
+        if is_fetch:
+            return jsonify(ok=False, error="auth_required"), 401
+        return redirect(url_for("login"))
+
+    use_us  = os.getenv("BINANCE_US", "false").lower() == "true"
+    testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_sec = os.getenv("BINANCE_API_SECRET")
+
+    client = Client(api_key, api_sec, tld=("us" if use_us else "com"), testnet=testnet)
+
+    # Symbols to import
+    raw = os.getenv("TRADE_SYMBOLS", "BTCUSDT")
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+    # Import from last DB trade (minus 5 min) or last 7 days if none
+    last_ts = db.session.query(func.max(Trade.timestamp)).scalar()
+    since = (last_ts - timedelta(minutes=5)) if last_ts else (datetime.utcnow() - timedelta(days=7))
+    since_ms = int(since.timestamp() * 1000)
+
+    inserted = 0
+    try:
+        for sym in symbols:
+            try:
+                fills = client.get_my_trades(symbol=sym, startTime=since_ms, recvWindow=60000)
+            except BinanceAPIException as e:
+                current_app.logger.error("sync_trades %s: %s", sym, e)
+                continue
+
+            for f in fills:
+                ts = datetime.utcfromtimestamp(f["time"] / 1000.0)
+                side = "BUY" if f.get("isBuyer") else "SELL"
+                qty = float(f["qty"])
+                price = float(f["price"])
+
+                # idempotency check
+                exists = Trade.query.filter_by(symbol=sym, timestamp=ts, price=price, amount=qty).first()
+                if exists:
+                    continue
+
+                db.session.add(Trade(
+                    symbol=sym,
+                    side=side,
+                    amount=qty,
+                    price=price,
+                    timestamp=ts,
+                    is_open=False,
+                    source="import"
+                ))
+                inserted += 1
+
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        if is_fetch:
+            return jsonify(ok=False, error=str(e)), 500
+        flash(f"Sync failed: {e}", "danger")
+        return redirect(url_for("dashboard"))
+
+    if is_fetch:
+        return jsonify(ok=True, imported=inserted)
+
+    flash(f"Imported {inserted} trade(s) from exchange.)", "success")
+    return redirect(url_for("dashboard"))
 
 # ============== Trading endpoints ==============
 @app.route('/live_trade', methods=['POST'])
