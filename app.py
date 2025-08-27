@@ -502,12 +502,11 @@ def auto_loop():
 
                 # BUY
                 if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
-                    qty_raw  = AUTO_RISK_USDT / price
-                    qty      = round_step(qty_raw, lot_step_str)
-                    qty_str  = qty_to_str(qty, lot_step_str)
-                    if float(qty_str) * price >= min_notional and float(qty_str) > 0:
-                        try:
-                            o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
+                    # spend at least min_notional, but also respect AUTO_RISK_USDT
+                      spend = max(AUTO_RISK_USDT, min_notional)
+                      o = client.create_order(symbol=sym, side="BUY", type="MARKET",
+                        quoteOrderQty=f"{spend:.2f}")
+
                         except BinanceAPIException as e:
                             _auto["err"] = str(e)
                             app.logger.warning("[AUTO] BUY %s API error: %s", sym, e)
@@ -528,11 +527,14 @@ def auto_loop():
 
                 # SELL
                 elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
-                    qty     = round_step(base_bal, lot_step_str)
-                    qty_str = qty_to_str(qty, lot_step_str)
-                    if float(qty_str) * price >= min_notional and float(qty_str) > 0:
-                        try:
-                            o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty_str)
+                    info = client.get_symbol_info(sym)
+                    lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+                    step_str = lot["stepSize"]
+                    min_qty_str = lot.get("minQty") or "0"
+
+                    qty_str = qty_to_str(base_bal, step_str, min_qty_str)
+                    o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty_str)
+
                         except BinanceAPIException as e:
                             _auto["err"] = str(e)
                             app.logger.warning("[AUTO] SELL %s API error: %s", sym, e)
@@ -638,41 +640,33 @@ def debug_live_buy():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
     if TESTNET:
-        return jsonify(ok=False, error="on testnet; use /debug/test_buy"), 400
+        return jsonify(ok=False, error="this route is for LIVE; use /debug/test_buy for testnet"), 400
 
     data = request.get_json(silent=True) or {}
     sym  = (data.get("symbol") or "BTCUSDT").upper()
-    usdt = float(data.get("usdt") or 10)
+    usdt = float(data.get("usdt") or 11)
+
+    c = make_client()
+    info = c.get_symbol_info(sym)
+
+    # figure out minNotional
+    min_notional = 5.0
+    for f in info.get("filters", []):
+        if f.get("filterType") in ("NOTIONAL", "MIN_NOTIONAL"):
+            mn = f.get("minNotional") or f.get("notional")
+            if mn is not None:
+                min_notional = float(mn)
+                break
+
+    spend = max(usdt, min_notional)  # ensure >= minNotional
 
     try:
-        c = make_client()
-        price = float(c.get_symbol_ticker(symbol=sym)["price"])
-
-        info = c.get_symbol_info(sym)
-        step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
-        # find min notional
-        min_notional = 5.0
-        for f in info["filters"]:
-            if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
-                mn = f.get("minNotional") or f.get("minNotional")
-                if mn is not None:
-                    min_notional = float(mn)
-
-        # raw qty, then quantize + stringify
-        qty_raw = Decimal(str(usdt)) / Decimal(str(price))
-        qty_str = qty_to_str(qty_raw, step_str)
-
-        if (Decimal(qty_str) * Decimal(str(price))) < Decimal(str(min_notional)) or Decimal(qty_str) <= 0:
-            return jsonify(ok=False, error=f"qty too small (minNotional≈{min_notional})"), 400
-
-        # pass STRING quantity to Binance
-        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
-
-        filled_qty = sum(Decimal(f["qty"]) for f in o.get("fills", [])) if o.get("fills") else Decimal(qty_str)
-        avg_price = (
-            (sum(Decimal(f["price"]) * Decimal(f["qty"]) for f in o.get("fills", [])) / filled_qty)
-            if o.get("fills") else Decimal(str(price))
-        )
+        # MARKET BUY by quote amount avoids LOT_SIZE issues
+        o = c.create_order(symbol=sym, side="BUY", type="MARKET",
+                           quoteOrderQty=f"{spend:.2f}")
+        return jsonify(ok=True, status=o.get("status"), cummulativeQuoteQty=o.get("cummulativeQuoteQty"))
+    except BinanceAPIException as e:
+        return jsonify(ok=False, error=str(e)), 400
 
         # persist to DB for dashboard
         try:
@@ -741,6 +735,31 @@ def qty_to_str(qty, step_str: str) -> str:
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s or "0"
+
+# --- qty formatting helper (uses stepSize/minQty) ---
+from decimal import Decimal, ROUND_DOWN
+
+def qty_to_str(qty, step_str, min_qty_str="0"):
+    """
+    Floors qty to the step and enforces >= min_qty.
+    Returns a string with the correct number of decimals for the step.
+    """
+    q = Decimal(str(qty))
+    step = Decimal(step_str)
+    min_qty = Decimal(str(min_qty_str or "0"))
+
+    # floor to step
+    q = (q // step) * step
+    if q < min_qty:
+        q = min_qty
+
+    # format with the same decimals as step_str
+    if "." in step_str:
+        places = len(step_str.split(".", 1)[1].rstrip("0"))
+    else:
+        places = 0
+    fmt = "{:0." + str(places) + "f}"
+    return fmt.format(q)
 
 
 # ============== Risk / guardrails ==============
