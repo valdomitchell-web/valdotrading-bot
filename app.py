@@ -111,8 +111,8 @@ NOTIFY_URL = os.getenv("NOTIFY_URL")  # e.g. https://hooks.example/abc123
 # Binance client
 # =========================
 def get_binance_client() -> Client:
-    c = make_client()
-try:
+        c = make_client()
+    try:
         server_time = client.get_server_time()["serverTime"]  # ms
         local_ms = int(time.time() * 1000)
         client.TIME_OFFSET = server_time - local_ms
