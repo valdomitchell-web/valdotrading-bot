@@ -3,7 +3,7 @@
 <head>
   <title>Trading Dashboard</title>
   <meta charset="utf-8" />
-  <style>
+  <style nonce="{{ csp_nonce }}">
     body { background: skyblue; font-family: Arial, sans-serif; padding: 20px; }
     h1, h2 { text-align: center; }
     .cards { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin: 10px 0 20px; }
@@ -54,7 +54,7 @@
     }
     td:nth-last-child(1) div { line-height: 1.25; }
     td:nth-last-child(1) b { display:inline-block; min-width: 82px; }
-  </style>
+  </style nonce="{{ csp_nonce }}">
 </head>
 <body>
   <h1>Trading Dashboard</h1>
@@ -245,15 +245,15 @@
   <p>No trades recorded.</p>
 {% endif %}
 
-<style>
+<style nonce="{{ csp_nonce }}">
   .badge{padding:.15rem .4rem;border-radius:.5rem;font-size:.75rem}
   .bg-green{background:#e6ffed;color:#046d37}
   .bg-gray{background:#eee;color:#333}
-</style>
+  </style nonce="{{ csp_nonce }}">
 
 
   <!-- Scripts -->
-  <script>
+  <script nonce="{{ csp_nonce }}">
     // --- Helpers ---
     async function postJSON(url, body) {
       const r = await fetch(url, {
@@ -526,9 +526,9 @@
       pollTrailStatus();
       setInterval(pollTrailStatus, 2000);
     })();
-  </script>
+  </script nonce="{{ csp_nonce }}">
 
-  <script>
+  <script nonce="{{ csp_nonce }}">
 document.addEventListener('DOMContentLoaded', () => {
   const btn = document.getElementById('btnSyncTrades');
   const syncMsg = document.getElementById('syncMsg');
@@ -555,7 +555,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 });
-</script>
+</script nonce="{{ csp_nonce }}">
   
 </body>
 </html>
