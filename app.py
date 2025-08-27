@@ -618,30 +618,87 @@ def auto_stop():
     _auto["stop"].set()
     return jsonify(ok=True)
 
-# --- Live debug buy (uses quoteOrderQty) ---
+# Replace your existing /debug/live_buy with this version
 @app.post("/debug/live_buy")
 def debug_live_buy():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-    if TESTNET:
-        return jsonify(ok=False, error="this route is for LIVE; use /debug/test_buy for testnet"), 400
 
     data = request.get_json(silent=True) or {}
     sym  = (data.get("symbol") or "BTCUSDT").upper()
     usdt = float(data.get("usdt") or 11)
 
-    c = make_client()
-    step_str, min_qty_str, min_notional = symbol_filters(c, sym)
-    spend = max(usdt, min_notional)
-
     try:
-        o = c.create_order(symbol=sym, side="BUY", type="MARKET",
-                           quoteOrderQty=f"{spend:.2f}")
-        return jsonify(ok=True, status=o.get("status"), cummulativeQuoteQty=o.get("cummulativeQuoteQty"))
+        c = make_client()
+        info = c.get_symbol_info(sym)
+        if not info:
+            return jsonify(ok=False, error=f"Unknown symbol {sym}"), 400
+
+        # Pull LOT_SIZE step and min notional
+        step_str = "0.00000001"
+        min_notional = 0.0
+        for f in info.get("filters", []):
+            if f.get("filterType") == "LOT_SIZE":
+                step_str = f.get("stepSize") or step_str
+            if f.get("filterType") in ("NOTIONAL", "MIN_NOTIONAL"):
+                try:
+                    min_notional = float(f.get("minNotional") or 0.0)
+                except Exception:
+                    pass
+
+        price = float(c.get_symbol_ticker(symbol=sym)["price"])
+        spend = max(usdt, min_notional or usdt)
+
+        # Format qty to exchange precision and floor to step
+        def qty_to_str(qty, step_str):
+            from decimal import Decimal, getcontext
+            getcontext().prec = 28
+            step = Decimal(step_str)
+            q = (Decimal(str(qty)) // step) * step  # floor to step
+            # figure decimals from step
+            s = step_str.rstrip('0')
+            decs = len(s.split('.',1)[1]) if '.' in s else 0
+            return f"{q:.{decs}f}"
+
+        qty_str = qty_to_str(spend/price, step_str)
+
+        try:
+            # Try quantity path first
+            o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
+        except BinanceAPIException as e:
+            # Fallback to quoteOrderQty on LOT_SIZE / illegal quantity issues
+            msg = str(e)
+            if ("-1013" in msg) or ("LOT_SIZE" in msg) or ("Illegal characters" in msg):
+                o = c.create_order(symbol=sym, side="BUY", type="MARKET",
+                                   quoteOrderQty=f"{spend:.2f}")
+            else:
+                return jsonify(ok=False, error=msg), 400
+
+        # Persist to DB for dashboard (best effort)
+        try:
+            fills = o.get("fills") or []
+            if fills:
+                filled_qty = sum(float(f["qty"]) for f in fills)
+                avg_price = (sum(float(f["price"])*float(f["qty"]) for f in fills) /
+                             max(filled_qty, 1e-12))
+            else:
+                filled_qty = float(o.get("executedQty") or 0.0)
+                avg_price = price
+            db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
+                                 timestamp=datetime.utcnow(), is_open=False, source="debug_live"))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        return jsonify(ok=True,
+                       status=o.get("status"),
+                       executedQty=o.get("executedQty"),
+                       cummulativeQuoteQty=o.get("cummulativeQuoteQty"))
     except BinanceAPIException as e:
         return jsonify(ok=False, error=str(e)), 400
-
-# ====================== END AUTO TRADER (DROP-IN) ============================
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+# ============== END of auto trader ==============
 
 # ============== Auth helpers ==============
 def is_authorized(req) -> bool:
