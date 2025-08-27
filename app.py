@@ -490,25 +490,22 @@ def auto_loop():
                 # BUY: EMA fast cross up, RSI below cap, and not already holding significant base
                 if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price_live < min_notional:
                     qty_raw = AUTO_RISK_USDT / price_live
-                    # BUY …
-qty = round_step(qty_raw, lot_step)
-if qty * price >= min_notional and qty > 0:
-    # format quantity to the LOT_SIZE step as a plain string
-    info = client.get_symbol_info(sym)
-    step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
-    qty_str = qty_to_str(qty, step_str)
+                    qty = round_step(qty_raw, lot_step)
+                 if qty * price >= min_notional and qty > 0:
+                 # format quantity to the LOT_SIZE step as a plain string
+                    info = client.get_symbol_info(sym)
+                    step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+                    qty_str = qty_to_str(qty, step_str)
 
-    o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
-    record_trade_ts(sym)
+                    o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
+                    record_trade_ts(sym)
 
-    filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
-    avg_price = (
-        sum(float(f["price"]) * float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-        if o.get("fills") else price
-    )
-
-                
-                        # persist to DB for dashboard
+                    filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
+                    avg_price = (
+                    sum(float(f["price"]) * float(f["qty"]) for f in o.get("fills", [])) / filled_qty
+                    if o.get("fills") else price
+                        )
+                     # persist to DB for dashboard
                         try:
                             db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
                                                  timestamp=datetime.utcnow(), is_open=False, source="auto"))
@@ -517,22 +514,22 @@ if qty * price >= min_notional and qty > 0:
                             db.session.rollback()
                         app.logger.info("[AUTO] BUY %s qty=%.8f @ %.2f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
 
-                # SELL: EMA fast cross down, RSI above floor, and we hold base
-                elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price_live >= min_notional:
-qty = round_step(base_bal, lot_step)
-if qty * price >= min_notional and qty > 0:
-    info = client.get_symbol_info(sym)
-    step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
-    qty_str = qty_to_str(qty, step_str)
+                     # SELL: EMA fast cross down, RSI above floor, and we hold base
+                     elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price_live >= min_notional:
+                     qty = round_step(base_bal, lot_step)
+                     if qty * price >= min_notional and qty > 0:
+                     info = client.get_symbol_info(sym)
+                     step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+                     qty_str = qty_to_str(qty, step_str)
 
-    o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty_str)
-    record_trade_ts(sym)
+                     o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty_str)
+                     record_trade_ts(sym)
 
-    filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
-    avg_price = (
-        sum(float(f["price"]) * float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-        if o.get("fills") else price
-    )
+                     filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
+                     avg_price = (
+                     sum(float(f["price"]) * float(f["qty"]) for f in o.get("fills", [])) / filled_qty
+                     if o.get("fills") else price
+                       )
 
                         try:
                             db.session.add(Trade(symbol=sym, side="SELL", amount=filled_qty, price=avg_price,
