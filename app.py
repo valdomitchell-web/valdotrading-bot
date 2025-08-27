@@ -26,7 +26,7 @@ from werkzeug.security import generate_password_hash
 # =========================
 # Load env & Flask config
 # =========================
-#load_dotenv()
+load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-fallback')
