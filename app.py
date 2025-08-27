@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+from flask import g
 import math
 import json
 import os
@@ -21,6 +22,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from werkzeug.security import generate_password_hash
+from secrets import token_urlsafe
 
 
 # =========================
@@ -41,6 +43,34 @@ def env_true(name, default="false"):
 
 app.config["USE_US"]  = env_true("BINANCE_US")          # False => .com, True => .us
 app.config["TESTNET"] = env_true("BINANCE_TESTNET")     # True => testnet
+
+# --- Nonce-based CSP (drop-in) ---
+def _csp_nonce():
+    # one nonce per response
+    if not hasattr(g, "csp_nonce"):
+        g.csp_nonce = token_urlsafe(16)
+    return g.csp_nonce
+
+@app.context_processor
+def inject_csp_nonce():
+    # makes {{ csp_nonce }} available in Jinja templates
+    return {"csp_nonce": _csp_nonce()}
+
+@app.after_request
+def set_csp(resp):
+    nonce = _csp_nonce()
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        f"script-src 'self' 'nonce-{nonce}'; "   # allow only self + this nonce
+        "style-src 'self' 'unsafe-inline'; "     # keep simple; see note below
+        "img-src 'self' data:; "
+        "connect-src 'self'; "                   # fetch/SSE to your own origin
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; object-src 'none'; form-action 'self'"
+    )
+    return resp
+# --- end CSP ---
+
 
 @app.get("/debug/env")
 def debug_env():
