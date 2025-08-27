@@ -336,6 +336,245 @@ def _bootstrap_db_once():
 _bootstrap_db_once()
 # --- end bootstrap ---
 
+# === Auto-trader config/helpers ===
+# If you haven’t added this helper yet:
+def env_true(name, default="false"):
+    return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
+
+USE_US   = env_true("BINANCE_US", "false")
+TESTNET  = env_true("BINANCE_TESTNET", "false")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # set this in Render
+
+AUTO_SYMBOLS = [s.strip().upper() for s in os.getenv("AUTO_SYMBOLS", "BTCUSDT").split(",") if s.strip()]
+AUTO_INTERVAL = os.getenv("AUTO_INTERVAL", "5m")  # 1m/3m/5m/15m/1h…
+AUTO_RISK_USDT = float(os.getenv("AUTO_RISK_USDT", "20"))  # USDT per trade
+AUTO_COOLDOWN_SEC = int(os.getenv("AUTO_COOLDOWN_SEC", "300"))  # after any trade per symbol
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
+RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
+BUY_RSI_MAX  = float(os.getenv("BUY_RSI_MAX", "60"))  # require momentum not overbought
+SELL_RSI_MIN = float(os.getenv("SELL_RSI_MIN", "40"))  # avoid panic exits in chop
+
+# single-runner state
+_auto = {"thread": None, "stop": Event(), "enabled": False, "last": None, "err": None, "last_trade_ts": {}}
+
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+def make_client():
+    return Client(
+        os.getenv("BINANCE_API_KEY"),
+        os.getenv("BINANCE_API_SECRET"),
+        tld=("us" if USE_US else "com"),
+        testnet=TESTNET,
+    )
+
+def round_step(qty, step):
+    d = Decimal(str(qty)); s = Decimal(str(step))
+    return float((d // s) * s)
+
+def symbol_filters(client, symbol):
+    info = client.get_symbol_info(symbol)
+    lot = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+    min_notional = None
+    for f in info["filters"]:
+        if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
+            min_notional = float(f.get("minNotional") or f.get("minNotional", 0))
+    return Decimal(str(lot)), (min_notional or 5.0)
+
+def ema(series, n):
+    k = 2/(n+1)
+    out=[]; e=None
+    for v in series:
+        e = v if e is None else (v - e)*k + e
+        out.append(e)
+    return out
+
+def rsi(closes, n=14):
+    rsis=[None]*len(closes)
+    if len(closes) < n+1: return rsis
+    gains=0.0; losses=0.0
+    for i in range(1, n+1):
+        ch = closes[i]-closes[i-1]
+        gains += max(ch, 0); losses += max(-ch, 0)
+    avg_g = gains/n; avg_l = losses/n
+    rsis[n] = 100.0 if avg_l==0 else 100 - 100/(1 + (avg_g/avg_l))
+    for i in range(n+1, len(closes)):
+        ch = closes[i]-closes[i-1]
+        up = max(ch, 0.0); dn = max(-ch, 0.0)
+        avg_g = (avg_g*(n-1) + up)/n
+        avg_l = (avg_l*(n-1) + dn)/n
+        rsis[i] = 100.0 if avg_l==0 else 100 - 100/(1 + (avg_g/avg_l))
+    return rsis
+
+def last_close_and_indicators(klines):
+    closes = [float(k[4]) for k in klines]
+    efast = ema(closes, EMA_FAST)
+    eslow = ema(closes, EMA_SLOW)
+    r = rsi(closes, RSI_LEN)
+    return closes, efast, eslow, r
+
+def crossed_up(a_prev, a_now, b_prev, b_now):   # a crosses above b
+    return a_prev is not None and b_prev is not None and a_prev <= b_prev and a_now > b_now
+
+def crossed_down(a_prev, a_now, b_prev, b_now): # a crosses below b
+    return a_prev is not None and b_prev is not None and a_prev >= b_prev and a_now < b_now
+
+def can_trade(symbol):
+    last = _auto["last_trade_ts"].get(symbol, 0)
+    return (time.time() - last) >= AUTO_COOLDOWN_SEC
+
+def record_trade_ts(symbol):
+    _auto["last_trade_ts"][symbol] = time.time()
+
+def auto_loop():
+    client = make_client()
+    app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f USDT", AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
+    try:
+        # cache filters
+        flt = {s: symbol_filters(client, s) for s in AUTO_SYMBOLS}
+    except Exception as e:
+        _auto["err"] = f"filters: {e}"
+        app.logger.exception("[AUTO] symbol_filters error")
+        return
+
+    while not _auto["stop"].is_set():
+        _auto["last"] = datetime.utcnow().isoformat()
+        for sym in AUTO_SYMBOLS:
+            try:
+                if not can_trade(sym):
+                    continue
+
+                kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
+                if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
+                    continue
+
+                closes, ef, es, r = last_close_and_indicators(kl)
+                p1, p2 = ef[-2], ef[-1]
+                q1, q2 = es[-2], es[-1]
+                rsi_now = r[-1] if r[-1] is not None else 50.0
+
+                bull_x = crossed_up(p1, p2, q1, q2)
+                bear_x = crossed_down(p1, p2, q1, q2)
+
+                # balances
+                acct = client.get_account()
+                bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                base = sym.replace("USDT","")
+                base_bal = bals.get(base, 0.0)
+                price = float(client.get_symbol_ticker(symbol=sym)["price"])
+                lot_step, min_notional = flt[sym]
+
+                # BUY: EMA fast cross up, RSI below cap, and not already holding significant base
+                if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
+                    qty_raw = AUTO_RISK_USDT / price
+                    qty = round_step(qty_raw, lot_step)
+                    if qty * price >= min_notional and qty > 0:
+                        o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
+                        record_trade_ts(sym)
+                        filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
+                        avg_price = (
+                            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
+                            if o.get("fills") else price
+                        )
+                        # persist to DB for dashboard
+                        try:
+                            db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
+                                                 timestamp=datetime.utcnow(), is_open=False, source="auto"))
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
+                        app.logger.info("[AUTO] BUY %s qty=%.8f @ %.2f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
+
+                # SELL: EMA fast cross down, RSI above floor, and we hold base
+                elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
+                    qty = round_step(base_bal, lot_step)
+                    if qty * price >= min_notional and qty > 0:
+                        o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty)
+                        record_trade_ts(sym)
+                        filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
+                        avg_price = (
+                            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
+                            if o.get("fills") else price
+                        )
+                        try:
+                            db.session.add(Trade(symbol=sym, side="SELL", amount=filled_qty, price=avg_price,
+                                                 timestamp=datetime.utcnow(), is_open=False, source="auto"))
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
+                        app.logger.info("[AUTO] SELL %s qty=%.8f @ %.2f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
+
+            except BinanceAPIException as e:
+                _auto["err"] = str(e)
+                app.logger.warning("[AUTO] %s error: %s", sym, e)
+            except Exception as e:
+                _auto["err"] = str(e)
+                app.logger.exception("[AUTO] %s exception", sym)
+
+        # small sleep (don’t hammer API). 30s is safe for 1m+ intervals.
+        _auto["stop"].wait(30)
+
+    app.logger.info("[AUTO] stopped")
+
+def require_admin():
+    # allow if session login exists OR header token matches ADMIN_TOKEN
+    if session.get("logged_in") or session.get("user_id"):
+        return True
+    token = request.headers.get("X-Admin-Token")
+    return ADMIN_TOKEN and token == ADMIN_TOKEN
+
+@app.get("/auto/status")
+def auto_status():
+    return jsonify(ok=True, running=(_auto["thread"] and _auto["thread"].is_alive()),
+                   enabled=_auto["enabled"], last=_auto["last"], err=_auto["err"])
+
+@app.post("/auto/start")
+def auto_start():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    if _auto["thread"] and _auto["thread"].is_alive():
+        _auto["enabled"] = True
+        return jsonify(ok=True, running=True)
+    _auto["stop"].clear()
+    _auto["enabled"] = True
+    th = Thread(target=auto_loop, daemon=True)
+    _auto["thread"] = th
+    th.start()
+    return jsonify(ok=True, running=True)
+
+@app.post("/auto/stop")
+def auto_stop():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    _auto["enabled"] = False
+    _auto["stop"].set()
+    return jsonify(ok=True)
+
+@app.post("/debug/test_buy")
+def debug_test_buy():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    if not TESTNET:
+        return jsonify(ok=False, error="not testnet"), 400
+
+    data = request.get_json(silent=True) or {}
+    sym  = (data.get("symbol") or "BTCUSDT").upper()
+    usdt = float(data.get("usdt") or 20)
+
+    c = make_client()
+    price = float(c.get_symbol_ticker(symbol=sym)["price"])
+    lot_step, min_notional = symbol_filters(c, sym)
+    qty = round_step(usdt / price, lot_step)
+
+    if qty <= 0 or qty * price < min_notional:
+        return jsonify(ok=False, error="qty too small"), 400
+
+    try:
+        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
+        return jsonify(ok=True, status=o.get("status"), qty=qty)
+    except BinanceAPIException as e:
+        return jsonify(ok=False, error=str(e)), 400
 
 # ============== Auth helpers ==============
 def is_authorized(req) -> bool:
@@ -1752,141 +1991,7 @@ def dashboard():
         auto_sync_interval=AUTO_SYNC_INTERVAL_S,
         trailing_cfg=load_trailing_cfg_dict()
     )
-
-# === AUTO TRADER (EMA + RSI) & DEBUG TEST BUY ===============================
-
-AUTO = {"enabled": False, "thread": None, "last": None, "err": None}
-
-def _bn_client():
-    use_us  = os.getenv("BINANCE_US","false").lower()=="true"
-    testnet = os.getenv("BINANCE_TESTNET","false").lower()=="true"
-    return Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_API_SECRET"),
-                  tld=("us" if use_us else "com"), testnet=testnet)
-
-def _ema(vals, n):
-    k = 2/(n+1); e = vals[0]
-    for v in vals[1:]: e = v*k + e*(1-k)
-    return e
-
-def _rsi(vals, n=14):
-    ups, dns = [], []
-    for i in range(1, len(vals)):
-        d = vals[i]-vals[i-1]
-        ups.append(max(d,0.0)); dns.append(max(-d,0.0))
-    if len(ups) < n: return 50.0
-    au = sum(ups[-n:])/n; ad = sum(dns[-n:])/n
-    if ad == 0: return 100.0
-    rs = au/ad
-    return 100 - 100/(1+rs)
-
-def _have_open(symbol):
-    try:
-        return db.session.query(Position).filter_by(symbol=symbol, is_open=True).count() > 0
-    except Exception:
-        return False
-
-def _strategy_step():
-    sym = os.getenv("TRADE_SYMBOLS","BTCUSDT").split(",")[0].strip().upper()
-    c = _bn_client()
-    kl = c.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_1MINUTE, limit=100)
-    closes = [float(k[4]) for k in kl]
-    if len(closes) < 30: return
-
-    ema12 = _ema(closes, 12)
-    ema26 = _ema(closes, 26)
-    rsi14 = _rsi(closes, 14)
-    price = closes[-1]
-
-    if _have_open(sym):
-        return
-
-    if ema12 > ema26 and rsi14 < 60:
-        info = c.get_symbol_info(sym)
-        step = 0.001
-        for f in info.get("filters", []):
-            if f.get("filterType") == "LOT_SIZE":
-                step = float(f["stepSize"]); break
-        qty = math.floor((20.0/price)/step)*step  # ~$20 notional for testing
-        if qty <= 0: return
-
-        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
-
-        try:
-            db.session.add(Trade(
-                symbol=sym, side="BUY", amount=qty, price=price,
-                timestamp=datetime.utcnow(), is_open=False, source="auto"
-            ))
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-
-def _auto_loop():
-    while True:
-        try:
-            if AUTO["enabled"]:
-                _strategy_step()
-                AUTO["last"] = datetime.utcnow().isoformat()
-                AUTO["err"] = None
-        except Exception as e:
-            AUTO["err"] = str(e)
-        time.sleep(60)
-
-def _ensure_thread():
-    if AUTO["thread"] is None or not AUTO["thread"].is_alive():
-        t = threading.Thread(target=_auto_loop, name="auto_loop", daemon=True)
-        t.start()
-        AUTO["thread"] = t
-
-@app.route("/auto/start", methods=["POST"])
-def auto_start():
-    if not session.get("user_id") and not session.get("logged_in"):
-        return jsonify(ok=False, error="auth"), 401
-    AUTO["enabled"] = True
-    _ensure_thread()
-    return jsonify(ok=True, enabled=True)
-
-@app.route("/auto/stop", methods=["POST"])
-def auto_stop():
-    if not session.get("user_id") and not session.get("logged_in"):
-        return jsonify(ok=False, error="auth"), 401
-    AUTO["enabled"] = False
-    return jsonify(ok=True, enabled=False)
-
-@app.route("/auto/status", methods=["GET"])
-def auto_status():
-    return jsonify(ok=True, enabled=AUTO["enabled"],
-                   last=AUTO["last"], err=AUTO["err"],
-                   running=bool(AUTO["thread"] and AUTO["thread"].is_alive()))
-
-@app.route("/debug/test_buy", methods=["POST"])
-def debug_test_buy():
-    if not session.get("user_id") and not session.get("logged_in"):
-        return jsonify(ok=False, error="auth"), 401
-    if os.getenv("BINANCE_TESTNET","false").lower() != "true":
-        return jsonify(ok=False, error="not testnet"), 400
-
-    data = request.get_json(silent=True) or {}
-    sym  = (data.get("symbol") or "BTCUSDT").upper()
-    usdt = float(data.get("usdt") or 20)
-
-    c = _bn_client()
-    price = float(c.get_symbol_ticker(symbol=sym)["price"])
-    info  = c.get_symbol_info(sym)
-    step = 0.001
-    for f in info.get("filters", []):
-        if f.get("filterType") == "LOT_SIZE":
-            step = float(f["stepSize"]); break
-    qty = math.floor((usdt/price)/step)*step
-    if qty <= 0:
-        return jsonify(ok=False, error="qty too small"), 400
-    try:
-        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
-        return jsonify(ok=True, status=o.get("status"), qty=qty)
-    except BinanceAPIException as e:
-        return jsonify(ok=False, error=str(e)), 400
-# ============================================================================
-# end patch
-
+    
 # ============== Paper trading monitor (unchanged) ==============
 def monitor_trades():
     with app.app_context():
