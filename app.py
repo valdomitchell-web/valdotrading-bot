@@ -336,44 +336,44 @@ def _bootstrap_db_once():
 _bootstrap_db_once()
 # --- end bootstrap ---
 
-# === Auto-trader config/helpers ===
-import os, time, math
-from datetime import datetime, timedelta
+# ========================= AUTO TRADER (DROP-IN) =============================
+# Uses MARKET BUY with quoteOrderQty (spend USDT) to avoid LOT_SIZE errors.
+# Uses precise qty_to_str for MARKET SELL to satisfy stepSize/minQty.
+# Routes: /auto/status, /auto/start, /auto/stop, /debug/live_buy
+
+import os, time
 from threading import Thread, Event
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
-from flask import request, session, jsonify
+from flask import jsonify, request, session
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
-# --- env helpers
+# If your app defines these above already, this will simply override with same behavior.
 def env_true(name, default="false"):
-    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+    return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
 
-USE_US        = env_true("BINANCE_US", "false")
-TESTNET       = env_true("BINANCE_TESTNET", "false")
-ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN")            # set in Render
-AUTO_SYMBOLS  = [s.strip().upper() for s in os.getenv("AUTO_SYMBOLS", "BTCUSDT").split(",") if s.strip()]
-AUTO_INTERVAL = os.getenv("AUTO_INTERVAL", "5m")
-AUTO_RISK_USDT      = float(os.getenv("AUTO_RISK_USDT", "20"))
-AUTO_COOLDOWN_SEC   = int(os.getenv("AUTO_COOLDOWN_SEC", "300"))
-EMA_FAST      = int(os.getenv("EMA_FAST", "9"))
-EMA_SLOW      = int(os.getenv("EMA_SLOW", "21"))
-RSI_LEN       = int(os.getenv("RSI_LEN", "14"))
-BUY_RSI_MAX   = float(os.getenv("BUY_RSI_MAX", "60"))
-SELL_RSI_MIN  = float(os.getenv("SELL_RSI_MIN", "40"))
-AUTO_LOG_IND  = env_true("AUTO_LOG_INDICATORS", "false")
+USE_US      = env_true("BINANCE_US", "false")
+TESTNET     = env_true("BINANCE_TESTNET", "false")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # set this in Render dashboard
 
-# single-runner state
-_auto = {
-    "thread": None,
-    "stop": Event(),
-    "enabled": False,
-    "last": None,
-    "err": None,
-    "last_trade_ts": {},   # per-symbol cooldown timestamps
-}
+AUTO_SYMBOLS      = [s.strip().upper() for s in os.getenv("AUTO_SYMBOLS", "BTCUSDT").split(",") if s.strip()]
+AUTO_INTERVAL     = os.getenv("AUTO_INTERVAL", "5m")   # e.g., 1m/3m/5m/15m/1h
+AUTO_RISK_USDT    = float(os.getenv("AUTO_RISK_USDT", "20"))  # USDT spend per BUY
+AUTO_COOLDOWN_SEC = int(os.getenv("AUTO_COOLDOWN_SEC", "300"))  # cooldown per symbol
 
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
+RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
+
+BUY_RSI_MAX  = float(os.getenv("BUY_RSI_MAX", "60"))  # cap to avoid overbought
+SELL_RSI_MIN = float(os.getenv("SELL_RSI_MIN", "40")) # avoid panic exits in chop
+
+# Runner state
+_auto = {"thread": None, "stop": Event(), "enabled": False, "last": None, "err": None, "last_trade_ts": {}}
+
+# --- Binance client ---
 def make_client():
     return Client(
         os.getenv("BINANCE_API_KEY"),
@@ -382,32 +382,53 @@ def make_client():
         testnet=TESTNET,
     )
 
-def qty_to_str(qty, step_str: str) -> str:
-    """Format a float qty to the exchange step as a plain decimal string."""
-    q = Decimal(str(qty)).quantize(Decimal(step_str), rounding=ROUND_DOWN)
-    s = format(q, "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s or "0"
-
-def round_step(qty, step_str: str) -> float:
-    """Floor qty to exchange LOT_SIZE step (returns float for math)."""
+# --- Filters / qty helpers ---
+def qty_to_str(qty, step_str, min_qty_str="0"):
+    """
+    Floors qty to stepSize and enforces >= minQty. Returns a string
+    with the correct number of decimals for the step.
+    """
     q = Decimal(str(qty))
-    s = Decimal(step_str)
-    return float((q // s) * s)
+    step = Decimal(step_str)
+    min_qty = Decimal(str(min_qty_str or "0"))
+
+    # floor to step
+    if step > 0:
+        q = (q // step) * step
+    if q < min_qty:
+        q = min_qty
+
+    if "." in step_str:
+        places = len(step_str.split(".", 1)[1].rstrip("0"))
+    else:
+        places = 0
+    fmt = "{:0." + str(places) + "f}"
+    return fmt.format(q)
 
 def symbol_filters(client, symbol):
-    """Return (lot_step_str, min_notional_float)."""
+    """
+    Returns: (step_str, min_qty_str, min_notional_float)
+    """
     info = client.get_symbol_info(symbol)
-    lot_step_str = next(f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE")
-    min_notional = None
-    for f in info["filters"]:
-        if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
-            mn = f.get("minNotional") or f.get("notional") or f.get("min_notional")
-            if mn:
-                min_notional = float(mn)
-    return lot_step_str, (min_notional or 5.0)
+    step_str = "1"
+    min_qty_str = "0"
+    min_notional = 5.0
 
+    for f in info.get("filters", []):
+        t = f.get("filterType")
+        if t == "LOT_SIZE":
+            step_str = f.get("stepSize", step_str)
+            min_qty_str = f.get("minQty", min_qty_str)
+        elif t in ("NOTIONAL", "MIN_NOTIONAL"):
+            mn = f.get("minNotional") or f.get("notional")
+            if mn is not None:
+                try:
+                    min_notional = float(mn)
+                except Exception:
+                    pass
+    return step_str, min_qty_str, min_notional
+
+# --- Indicators ---
 def ema(series, n):
     k = 2/(n+1)
     out, e = [], None
@@ -418,10 +439,11 @@ def ema(series, n):
 
 def rsi(closes, n=14):
     rsis = [None]*len(closes)
-    if len(closes) < n+1: return rsis
+    if len(closes) < n+1:
+        return rsis
     gains = losses = 0.0
     for i in range(1, n+1):
-        ch = closes[i] - closes[i-1]
+        ch = closes[i]-closes[i-1]
         gains += max(ch, 0.0); losses += max(-ch, 0.0)
     avg_g = gains/n; avg_l = losses/n
     rsis[n] = 100.0 if avg_l == 0 else 100 - 100/(1 + (avg_g/avg_l))
@@ -432,13 +454,6 @@ def rsi(closes, n=14):
         avg_l = (avg_l*(n-1) + dn)/n
         rsis[i] = 100.0 if avg_l == 0 else 100 - 100/(1 + (avg_g/avg_l))
     return rsis
-
-def last_close_and_indicators(klines):
-    closes = [float(k[4]) for k in klines]
-    ef = ema(closes, EMA_FAST)
-    es = ema(closes, EMA_SLOW)
-    r  = rsi(closes, RSI_LEN)
-    return closes, ef, es, r
 
 def crossed_up(a_prev, a_now, b_prev, b_now):
     return a_prev is not None and b_prev is not None and a_prev <= b_prev and a_now > b_now
@@ -453,13 +468,21 @@ def can_trade(symbol):
 def record_trade_ts(symbol):
     _auto["last_trade_ts"][symbol] = time.time()
 
-def auto_loop():
-    client = make_client()
-    app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f USDT", AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
+# --- Admin auth helper for API routes ---
+def require_admin():
+    if session.get("logged_in") or session.get("user_id"):
+        return True
+    token = request.headers.get("X-Admin-Token")
+    return bool(ADMIN_TOKEN) and token == ADMIN_TOKEN
 
-    # cache filters up-front
+# --- Main loop ---
+def auto_loop():
+    c = make_client()
+    app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f", AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
+
+    # Cache symbol filters
     try:
-        filters = {s: symbol_filters(client, s) for s in AUTO_SYMBOLS}
+        flt = {s: symbol_filters(c, s) for s in AUTO_SYMBOLS}
     except Exception as e:
         _auto["err"] = f"filters: {e}"
         app.logger.exception("[AUTO] symbol_filters error")
@@ -468,108 +491,102 @@ def auto_loop():
     while not _auto["stop"].is_set():
         _auto["last"] = datetime.utcnow().isoformat()
 
-        # when disabled, just idle briefly
-        if not _auto["enabled"]:
-            _auto["stop"].wait(1.0)
-            continue
-
         for sym in AUTO_SYMBOLS:
             try:
                 if not can_trade(sym):
                     continue
 
-                kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
+                kl = c.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
                 if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
                     continue
 
-                closes, ef, es, r = last_close_and_indicators(kl)
+                closes = [float(k[4]) for k in kl]
+                ef = ema(closes, EMA_FAST)
+                es = ema(closes, EMA_SLOW)
+                r  = rsi(closes, RSI_LEN)
+
                 p1, p2 = ef[-2], ef[-1]
                 q1, q2 = es[-2], es[-1]
                 rsi_now = r[-1] if r[-1] is not None else 50.0
+
                 bull_x = crossed_up(p1, p2, q1, q2)
                 bear_x = crossed_down(p1, p2, q1, q2)
 
-                if AUTO_LOG_IND:
-                    app.logger.info("[AUTO] %s p2=%.2f q2=%.2f rsi=%.1f bull=%s bear=%s",
-                                    sym, p2, q2, rsi_now, bull_x, bear_x)
-
-                acct  = client.get_account()
-                bals  = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-                base  = sym.replace("USDT", "")
+                # account + balances
+                acct = c.get_account()
+                bals = {b["asset"]: float(b["free"]) for b in acct.get("balances", [])}
+                base = sym.replace("USDT", "")
                 base_bal = bals.get(base, 0.0)
-                price = float(client.get_symbol_ticker(symbol=sym)["price"])
-                lot_step_str, min_notional = filters[sym]
 
-                # BUY
+                price = float(c.get_symbol_ticker(symbol=sym)["price"])
+                step_str, min_qty_str, min_notional = flt[sym]
+
+                # BUY (use quoteOrderQty to avoid LOT_SIZE issues)
                 if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
-                    # spend at least min_notional, but also respect AUTO_RISK_USDT
-                      spend = max(AUTO_RISK_USDT, min_notional)
-                      o = client.create_order(symbol=sym, side="BUY", type="MARKET",
-                        quoteOrderQty=f"{spend:.2f}")
+                    spend = max(AUTO_RISK_USDT, min_notional)
+                    try:
+                        o = c.create_order(symbol=sym, side="BUY", type="MARKET",
+                                           quoteOrderQty=f"{spend:.2f}")
+                        record_trade_ts(sym)
 
-                        except BinanceAPIException as e:
-                            _auto["err"] = str(e)
-                            app.logger.warning("[AUTO] BUY %s API error: %s", sym, e)
-                        else:
-                            record_trade_ts(sym)
-                            filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
-                            avg_price  = (
+                        # persist to DB for dashboard (optional; requires db, Trade in your app)
+                        try:
+                            filled_quote = float(o.get("cummulativeQuoteQty") or spend)
+                            filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) if o.get("fills") else filled_quote / price
+                            avg_price = (
                                 sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
                                 if o.get("fills") else price
                             )
-                            try:
-                                db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
-                                                     timestamp=datetime.utcnow(), is_open=False, source="auto"))
-                                db.session.commit()
-                            except Exception:
-                                db.session.rollback()
-                            app.logger.info("[AUTO] BUY %s qty=%s @ %.2f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
+                            db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
+                                                 timestamp=datetime.utcnow(), is_open=False, source="auto"))
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
 
-                # SELL
+                        app.logger.info("[AUTO] BUY %s $%.2f | RSI=%.1f", sym, spend, rsi_now)
+                    except BinanceAPIException as e:
+                        _auto["err"] = str(e)
+                        app.logger.warning("[AUTO] BUY %s error: %s", sym, e)
+
+                # SELL (format quantity precisely to step/minQty)
                 elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
-                    info = client.get_symbol_info(sym)
-                    lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
-                    step_str = lot["stepSize"]
-                    min_qty_str = lot.get("minQty") or "0"
-
                     qty_str = qty_to_str(base_bal, step_str, min_qty_str)
-                    o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty_str)
+                    if Decimal(qty_str) <= 0:
+                        continue
+                    try:
+                        o = c.create_order(symbol=sym, side="SELL", type="MARKET", quantity=qty_str)
+                        record_trade_ts(sym)
 
-                        except BinanceAPIException as e:
-                            _auto["err"] = str(e)
-                            app.logger.warning("[AUTO] SELL %s API error: %s", sym, e)
-                        else:
-                            record_trade_ts(sym)
-                            filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or float(qty_str)
-                            avg_price  = (
-                                sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
-                                if o.get("fills") else price
+                        try:
+                            filled_qty = sum(Decimal(f["qty"]) for f in o.get("fills", [])) if o.get("fills") else Decimal(qty_str)
+                            avg_price = (
+                                (sum(Decimal(f["price"])*Decimal(f["qty"]) for f in o.get("fills", [])) / filled_qty)
+                                if o.get("fills") and filled_qty > 0 else Decimal(str(price))
                             )
-                            try:
-                                db.session.add(Trade(symbol=sym, side="SELL", amount=filled_qty, price=avg_price,
-                                                     timestamp=datetime.utcnow(), is_open=False, source="auto"))
-                                db.session.commit()
-                            except Exception:
-                                db.session.rollback()
-                            app.logger.info("[AUTO] SELL %s qty=%s @ %.2f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
+                            db.session.add(Trade(symbol=sym, side="SELL", amount=float(filled_qty), price=float(avg_price),
+                                                 timestamp=datetime.utcnow(), is_open=False, source="auto"))
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
+
+                        app.logger.info("[AUTO] SELL %s qty=%s | RSI=%.1f", sym, qty_str, rsi_now)
+                    except BinanceAPIException as e:
+                        _auto["err"] = str(e)
+                        app.logger.warning("[AUTO] SELL %s error: %s", sym, e)
 
             except BinanceAPIException as e:
                 _auto["err"] = str(e)
-                app.logger.warning("[AUTO] %s error: %s", sym, e)
+                app.logger.warning("[AUTO] %s API error: %s", sym, e)
             except Exception as e:
                 _auto["err"] = str(e)
                 app.logger.exception("[AUTO] %s exception", sym)
 
-        _auto["stop"].wait(30.0)
+        # don’t hammer API
+        _auto["stop"].wait(30)
 
     app.logger.info("[AUTO] stopped")
 
-def require_admin():
-    if session.get("logged_in") or session.get("user_id"):
-        return True
-    token = request.headers.get("X-Admin-Token")
-    return bool(ADMIN_TOKEN) and token == ADMIN_TOKEN
-
+# --- Routes ---
 @app.get("/auto/status")
 def auto_status():
     return jsonify(
@@ -585,11 +602,12 @@ def auto_start():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
     _auto["enabled"] = True
-    if not _auto["thread"] or not _auto["thread"].is_alive():
-        _auto["stop"].clear()
-        th = Thread(target=auto_loop, daemon=True)
-        _auto["thread"] = th
-        th.start()
+    if _auto["thread"] and _auto["thread"].is_alive():
+        return jsonify(ok=True, running=True)
+    _auto["stop"].clear()
+    th = Thread(target=auto_loop, daemon=True)
+    _auto["thread"] = th
+    th.start()
     return jsonify(ok=True, running=True)
 
 @app.post("/auto/stop")
@@ -600,32 +618,30 @@ def auto_stop():
     _auto["stop"].set()
     return jsonify(ok=True)
 
-@app.post("/debug/test_buy")
-def debug_test_buy():
+# --- Live debug buy (uses quoteOrderQty) ---
+@app.post("/debug/live_buy")
+def debug_live_buy():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-    if not TESTNET:
-        return jsonify(ok=False, error="not testnet"), 400
+    if TESTNET:
+        return jsonify(ok=False, error="this route is for LIVE; use /debug/test_buy for testnet"), 400
 
     data = request.get_json(silent=True) or {}
     sym  = (data.get("symbol") or "BTCUSDT").upper()
-    usdt = float(data.get("usdt") or 20)
+    usdt = float(data.get("usdt") or 11)
 
     c = make_client()
-    price = float(c.get_symbol_ticker(symbol=sym)["price"])
-    lot_step_str, min_notional = symbol_filters(c, sym)
-    qty  = round_step(usdt / price, lot_step_str)
-    qty_str = qty_to_str(qty, lot_step_str)
-
-    if float(qty_str) <= 0 or float(qty_str) * price < min_notional:
-        return jsonify(ok=False, error="qty too small"), 400
+    step_str, min_qty_str, min_notional = symbol_filters(c, sym)
+    spend = max(usdt, min_notional)
 
     try:
-        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
-        return jsonify(ok=True, status=o.get("status"), qty=qty_str)
+        o = c.create_order(symbol=sym, side="BUY", type="MARKET",
+                           quoteOrderQty=f"{spend:.2f}")
+        return jsonify(ok=True, status=o.get("status"), cummulativeQuoteQty=o.get("cummulativeQuoteQty"))
     except BinanceAPIException as e:
         return jsonify(ok=False, error=str(e)), 400
-# === end auto-trader ===
+
+# ====================== END AUTO TRADER (DROP-IN) ============================
 
 # --- LIVE TEST BUY (admin-protected) ----------------------------------------
 from flask import request, jsonify
