@@ -601,6 +601,56 @@ def debug_test_buy():
         return jsonify(ok=False, error=str(e)), 400
 # === END AUTO TRADER =========================================================
 
+# --- LIVE TEST BUY (admin-protected) ----------------------------------------
+from flask import request, jsonify
+from datetime import datetime
+from decimal import Decimal
+from binance.exceptions import BinanceAPIException
+
+# uses your existing helpers: require_admin(), TESTNET, make_client(), symbol_filters, round_step
+
+@app.post("/debug/live_buy")
+def debug_live_buy():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    if TESTNET:
+        return jsonify(ok=False, error="on testnet; use /debug/test_buy"), 400
+
+    data = request.get_json(silent=True) or {}
+    sym  = (data.get("symbol") or "BTCUSDT").upper()
+    usdt = float(data.get("usdt") or 10)  # default ~ $10
+
+    try:
+        c = make_client()
+        price = float(c.get_symbol_ticker(symbol=sym)["price"])
+        lot_step, min_notional = symbol_filters(c, sym)
+        qty = round_step(usdt / price, lot_step)
+        if qty <= 0 or qty * price < min_notional:
+            return jsonify(ok=False, error=f"qty too small (minNotional≈{min_notional})"), 400
+
+        o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty)
+        filled_qty = sum(float(f["qty"]) for f in o.get("fills", [])) or qty
+        avg_price = (
+            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / filled_qty
+            if o.get("fills") else price
+        )
+
+        # persist to DB so dashboard can show it
+        try:
+            db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
+                                 timestamp=datetime.utcnow(), is_open=False, source="live_debug"))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        app.logger.info("[DEBUG] LIVE BUY %s qty=%.8f @ %.2f", sym, filled_qty, avg_price)
+        return jsonify(ok=True, status=o.get("status"), qty=filled_qty, avg_price=avg_price)
+    except BinanceAPIException as e:
+        return jsonify(ok=False, error=str(e)), 400
+    except Exception as e:
+        app.logger.exception("live_buy exception")
+        return jsonify(ok=False, error=str(e)), 500
+# ---------------------------------------------------------------------------
 # ============== Auth helpers ==============
 def is_authorized(req) -> bool:
     # Existing API key path
@@ -1410,17 +1460,25 @@ def admin_bootstrap():
         db.session.rollback()
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# --- SYNC TRADES (imports fills from exchange into Trades table) ------------
+from flask import request, jsonify, redirect, url_for, flash, current_app, session
+from sqlalchemy.sql import func
+from datetime import datetime, timedelta
+
 @app.route("/sync_trades", methods=["POST"])
 def sync_trades():
-    # Are we being called from fetch()?
+    # Called by fetch() ? (lets us return JSON with codes)
     is_fetch = request.headers.get("X-Requested-With") == "fetch"
 
-    # Require login
+    # Require login (session) OR allow admin header if you prefer:
     authed = session.get("user_id") or session.get("logged_in")
     if not authed:
-        if is_fetch:
-            return jsonify(ok=False, error="auth_required"), 401
-        return redirect(url_for("login"))
+        # OPTIONAL: also allow ADMIN_TOKEN header:
+        token = request.headers.get("X-Admin-Token")
+        if not (ADMIN_TOKEN and token == ADMIN_TOKEN):
+            if is_fetch:
+                return jsonify(ok=False, error="auth_required"), 401
+            return redirect(url_for("login"))
 
     use_us  = os.getenv("BINANCE_US", "false").lower() == "true"
     testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
@@ -1430,10 +1488,10 @@ def sync_trades():
     client = Client(api_key, api_sec, tld=("us" if use_us else "com"), testnet=testnet)
 
     # Symbols to import
-    raw = os.getenv("TRADE_SYMBOLS", "BTCUSDT")
+    raw = os.getenv("TRADE_SYMBOLS", os.getenv("AUTO_SYMBOLS", "BTCUSDT"))
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
 
-    # Import from last DB trade (minus 5 min) or last 7 days if none
+    # From last DB trade (minus 5 min) or last 7 days if none
     last_ts = db.session.query(func.max(Trade.timestamp)).scalar()
     since = (last_ts - timedelta(minutes=5)) if last_ts else (datetime.utcnow() - timedelta(days=7))
     since_ms = int(since.timestamp() * 1000)
@@ -1445,6 +1503,9 @@ def sync_trades():
                 fills = client.get_my_trades(symbol=sym, startTime=since_ms, recvWindow=60000)
             except BinanceAPIException as e:
                 current_app.logger.error("sync_trades %s: %s", sym, e)
+                # common cause: keys/permissions/IP; bubble up as 400 for fetch callers
+                if is_fetch:
+                    return jsonify(ok=False, error=str(e)), 400
                 continue
 
             for f in fills:
@@ -1453,7 +1514,7 @@ def sync_trades():
                 qty = float(f["qty"])
                 price = float(f["price"])
 
-                # idempotency check
+                # idempotency (same symbol/timestamp/price/qty)
                 exists = Trade.query.filter_by(symbol=sym, timestamp=ts, price=price, amount=qty).first()
                 if exists:
                     continue
@@ -1470,8 +1531,10 @@ def sync_trades():
                 inserted += 1
 
         db.session.commit()
+        current_app.logger.info("[SYNC_TRADES] imported=%d since=%s symbols=%s", inserted, since.isoformat(), symbols)
     except Exception as e:
         db.session.rollback()
+        current_app.logger.exception("[SYNC_TRADES] failed")
         if is_fetch:
             return jsonify(ok=False, error=str(e)), 500
         flash(f"Sync failed: {e}", "danger")
@@ -1480,10 +1543,10 @@ def sync_trades():
     if is_fetch:
         return jsonify(ok=True, imported=inserted)
 
-    flash(f"Imported {inserted} trade(s) from exchange.)", "success")
+    flash(f"Imported {inserted} trade(s) from exchange.", "success")
     return redirect(url_for("dashboard"))
+# ---------------------------------------------------------------------------
 
-# ============== Trading endpoints ==============
 @app.route('/live_trade', methods=['POST'])
 def live_trade():
     if not is_authorized(request):
