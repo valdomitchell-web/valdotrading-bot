@@ -576,14 +576,19 @@ def auto_loop():
                                 sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
                             ) if fills else price
 
-                            try:
+                           try:
                                 db.session.add(Trade(symbol=sym, side="BUY", amount=float(filled_qty),
                                                      price=float(avg_price), timestamp=datetime.utcnow(),
                                                      is_open=False, source="auto"))
                                 db.session.commit()
                             except Exception:
                                 db.session.rollback()
+                            # ensure a DB position exists/updates avg price
+                            pos = ensure_position_on_buy(sym, filled_qty, avg_price)
+                            # record order locally for the dashboard
+                            record_order_row(o, 'BUY', sym, float(filled_qty), float(avg_price), position_id=(pos.id if pos else None))
 
+                        
                             app.logger.info("[AUTO] BUY %s qty=%.8f @ %.2f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
                             decided.update({"action": "BUY", "reason": "signal"})
                         except BinanceAPIException as e:
@@ -617,6 +622,11 @@ def auto_loop():
                                     db.session.commit()
                                 except Exception:
                                     db.session.rollback()
+
+                                # record order locally for the dashboard
+                                record_order_row(o, 'SELL', sym, float(filled_qty), float(avg_price), position_id=None)
+                                # try to close any matching open position once sufficiently sold
+                                close_position_if_filled_sells(sym)
 
                                 app.logger.info("[AUTO] SELL %s qty=%s @ %.2f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
                                 decided.update({"action": "SELL", "reason": "signal"})
@@ -2254,14 +2264,14 @@ def dashboard():
     orders_open = (Order.query.filter(Order.status.in_(['NEW','PARTIALLY_FILLED']))
                    .order_by(Order.created_at.desc()).limit(50).all())
 
-    # If DB has no open positions, fall back to live balances for AUTO_SYMBOLS
+    # Fallback: if no DB positions, synthesize "open positions" from live exchange balances
     used_live_fallback = False
     if not positions_open:
         try:
-            c = make_client()
+            c = get_binance_client()
             acct = c.get_account()
             bals = {b["asset"]: float(b["free"]) for b in acct["balances"] if float(b["free"]) > 0}
-            live_positions = []
+            rows = []
             symbols = (AUTO_SYMBOLS or ["BTCUSDT"])
             for sym in symbols:
                 if not sym.endswith("USDT"):
@@ -2271,20 +2281,20 @@ def dashboard():
                 if qty <= 0:
                     continue
                 price = float(c.get_symbol_ticker(symbol=sym)["price"])
-                # Mimic the Position model fields the template already uses
-                live_positions.append(SimpleNamespace(
-                    id=None,
-                    symbol=sym,
-                    side='LONG',
-                    qty=qty,
-                    avg_price=price,      # unknown true entry; use current so PnL≈0
-                    opened_at=None,
-                    closed_at=None,
-                    status='OPEN',
-                    realized_pnl=0.0
-                ))
-            if live_positions:
-                positions_open = live_positions
+                # Use dicts; Jinja dot access works with dict keys.
+                rows.append({
+                    "id": None,
+                    "symbol": sym,
+                    "side": "LONG",
+                    "qty": qty,
+                    "avg_price": price,  # unknown true entry; use current so PnL≈0
+                    "opened_at": None,
+                    "closed_at": None,
+                    "status": "OPEN",
+                    "realized_pnl": 0.0,
+                })
+            if rows:
+                positions_open = rows
                 used_live_fallback = True
         except Exception as e:
             app.logger.warning("live positions fallback failed: %s", e)
@@ -2296,10 +2306,14 @@ def dashboard():
         except Exception:
             return 0.0
 
-    realized = sum((p.realized_pnl or 0.0) for p in positions_closed)
+    realized = sum((p.get("realized_pnl", 0.0) if isinstance(p, dict) else (p.realized_pnl or 0.0))
+                   for p in positions_closed)
     # For live-fallback rows avg_price == current, so unrealized≈0 (by design)
-    unrealized = sum((current_price(p.symbol) - (p.avg_price or 0.0)) * (p.qty or 0.0)
-                     for p in positions_open)
+    def _avg(p):  return p["avg_price"] if isinstance(p, dict) else (p.avg_price or 0.0)
+    def _qty(p):  return p["qty"]       if isinstance(p, dict) else (p.qty or 0.0)
+    def _sym(p):  return p["symbol"]    if isinstance(p, dict) else p.symbol
+
+    unrealized = sum((current_price(_sym(p)) - _avg(p)) * _qty(p) for p in positions_open)
 
     return render_template(
         'dashboard.html',
@@ -2312,7 +2326,7 @@ def dashboard():
         auto_sync_enabled=_AUTO_SYNC_ENABLED,
         auto_sync_interval=AUTO_SYNC_INTERVAL_S,
         trailing_cfg=load_trailing_cfg_dict(),
-        live_fallback=used_live_fallback  # extra context (template doesn’t need to use it)
+        live_fallback=used_live_fallback
     )
 
 # ============== Paper trading monitor (unchanged) ==============
