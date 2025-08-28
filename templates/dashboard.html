@@ -556,6 +556,53 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 </script nonce="{{ csp_nonce }}">
-  
+
+    <script>
+(async function(){
+  try {
+    const r = await fetch('/balances_live', {cache:'no-store'});
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!j.ok || !Array.isArray(j.rows) || j.rows.length === 0) return;
+
+    const anchor = document.getElementById('syncControls') || document.body;
+    const wrap = document.createElement('div');
+    wrap.id = 'liveBalances';
+    wrap.style.margin = '14px 0';
+    wrap.innerHTML = `
+      <h3 style="margin:8px 0;">Exchange Balances (Live)</h3>
+      <div style="overflow:auto;border:1px solid #ddd;border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;">
+          <thead style="background:#f8f9fa;">
+            <tr>
+              <th style="text-align:left;padding:8px;border-bottom:1px solid #eee;">Symbol</th>
+              <th style="text-align:right;padding:8px;border-bottom:1px solid #eee;">Qty</th>
+              <th style="text-align:right;padding:8px;border-bottom:1px solid #eee;">Price</th>
+              <th style="text-align:right;padding:8px;border-bottom:1px solid #eee;">Notional (USDT)</th>
+            </tr>
+          </thead>
+          <tbody id="liveBalancesBody"></tbody>
+        </table>
+      </div>
+    `;
+    anchor.insertAdjacentElement('afterend', wrap);
+
+    const tbody = document.getElementById('liveBalancesBody');
+    j.rows.forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="padding:8px;border-bottom:1px solid #f0f0f0;">${row.symbol}</td>
+        <td style="padding:8px;border-bottom:1px solid #f0f0f0;text-align:right;">${Number(row.qty).toFixed(8)}</td>
+        <td style="padding:8px;border-bottom:1px solid #f0f0f0;text-align:right;">${Number(row.price).toFixed(2)}</td>
+        <td style="padding:8px;border-bottom:1px solid #f0f0f0;text-align:right;">${Number(row.notional).toFixed(2)}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch(e) {
+    console.warn('balances_live failed', e);
+  }
+})();
+</script>
+    
 </body>
 </html>
