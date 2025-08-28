@@ -122,6 +122,18 @@
         </div>
       </td>
 
+    <h3 style="margin-top:1.25rem">Live Exchange Balances</h3>
+<table id="liveBal" class="table">
+  <thead>
+    <tr>
+      <th>Symbol</th><th>Qty</th><th>Last Price</th><th>Notional (USDT)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td colspan="4">Loading…</td></tr>
+  </tbody>
+</table>
+
       <!-- Trailing controls -->
       <td>
         <div style="display:flex; gap:6px; align-items:center;">
@@ -603,6 +615,37 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 })();
 </script>
-    
+
+<script>
+async function loadLiveBalances() {
+  try {
+    const r = await fetch('/balances_live', { headers: { 'X-Requested-With': 'fetch' }});
+    const j = await r.json();
+    const tb = document.querySelector('#liveBal tbody');
+    if (!j.ok) {
+      tb.innerHTML = `<tr><td colspan="4">Error loading balances</td></tr>`;
+      return;
+    }
+    if (!j.rows || !j.rows.length) {
+      tb.innerHTML = `<tr><td colspan="4">No balances</td></tr>`;
+      return;
+    }
+    tb.innerHTML = j.rows.map(row => `
+      <tr>
+        <td>${row.symbol}</td>
+        <td>${Number(row.qty).toFixed(8)}</td>
+        <td>${Number(row.price).toFixed(2)}</td>
+        <td>${Number(row.notional).toFixed(2)}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    const tb = document.querySelector('#liveBal tbody');
+    if (tb) tb.innerHTML = `<tr><td colspan="4">Error: ${e?.message || e}</td></tr>`;
+  }
+}
+loadLiveBalances();
+setInterval(loadLiveBalances, 5000);
+</script>
+      
 </body>
 </html>
