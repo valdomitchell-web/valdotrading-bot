@@ -675,20 +675,20 @@ def debug_live_buy():
                 return jsonify(ok=False, error=msg), 400
 
         # Persist to DB for dashboard (best effort)
-        try:
-            fills = o.get("fills") or []
-            if fills:
-                filled_qty = sum(float(f["qty"]) for f in fills)
-                avg_price = (sum(float(f["price"])*float(f["qty"]) for f in fills) /
-                             max(filled_qty, 1e-12))
-            else:
-                filled_qty = float(o.get("executedQty") or 0.0)
-                avg_price = price
-            db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
-                                 timestamp=datetime.utcnow(), is_open=False, source="debug_live"))
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
+        #try:
+           # fills = o.get("fills") or []
+           # if fills:
+               # filled_qty = sum(float(f["qty"]) for f in fills)
+               # avg_price = (sum(float(f["price"])*float(f["qty"]) for f in fills) /
+                            # max(filled_qty, 1e-12))
+            #else:
+               # filled_qty = float(o.get("executedQty") or 0.0)
+                #avg_price = price
+           # db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
+                                 #timestamp=datetime.utcnow(), is_open=False, source="debug_live"))
+            #db.session.commit()
+        #except Exception:
+            #db.session.rollback()
 
         return jsonify(ok=True,
                        status=o.get("status"),
