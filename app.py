@@ -40,11 +40,8 @@ db = SQLAlchemy(app)
 
 load_dotenv(override=False)  # don't override Render env vars with .env
 
-def env_true(name, default="false"):
-    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
-
-app.config["USE_US"]  = env_true("BINANCE_US")          # False => .com, True => .us
-app.config["TESTNET"] = env_true("BINANCE_TESTNET")     # True => testnet
+#app.config["USE_US"]  = env_true("BINANCE_US")          # False => .com, True => .us
+#app.config["TESTNET"] = env_true("BINANCE_TESTNET")     # True => testnet
 
 # --- Nonce-based CSP (drop-in) ---
 def _csp_nonce():
@@ -768,45 +765,6 @@ def infer_source_from_request(req, default='manual'):
     ):
         return 'webhook'
     return default
-
-from decimal import Decimal, ROUND_DOWN
-
-def qty_to_str(qty, step_str: str) -> str:
-    """
-    Quantize qty to the LOT_SIZE step and return a plain string (no scientific notation).
-    """
-    q = Decimal(str(qty)).quantize(Decimal(step_str), rounding=ROUND_DOWN)
-    s = format(q, "f")  # '0.000183' instead of '1.83E-4'
-    # strip trailing zeros / dot (Binance accepts both, but this keeps it clean)
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s or "0"
-
-# --- qty formatting helper (uses stepSize/minQty) ---
-from decimal import Decimal, ROUND_DOWN
-
-def qty_to_str(qty, step_str, min_qty_str="0"):
-    """
-    Floors qty to the step and enforces >= min_qty.
-    Returns a string with the correct number of decimals for the step.
-    """
-    q = Decimal(str(qty))
-    step = Decimal(step_str)
-    min_qty = Decimal(str(min_qty_str or "0"))
-
-    # floor to step
-    q = (q // step) * step
-    if q < min_qty:
-        q = min_qty
-
-    # format with the same decimals as step_str
-    if "." in step_str:
-        places = len(step_str.split(".", 1)[1].rstrip("0"))
-    else:
-        places = 0
-    fmt = "{:0." + str(places) + "f}"
-    return fmt.format(q)
-
 
 # ============== Risk / guardrails ==============
 _last_signal_at: dict[str, float] = {}  # symbol -> epoch seconds
@@ -1709,13 +1667,6 @@ def sync_trades():
 
     flash(f"Imported {inserted} trade(s) from exchange.", "success")
     return redirect(url_for("dashboard"))
-
-@app.get("/auto/decisions")
-def auto_decisions():
-    if not (session.get("user_id") or session.get("logged_in") or
-            (ADMIN_TOKEN and request.headers.get("X-Admin-Token") == ADMIN_TOKEN)):
-        return jsonify(ok=False, error="auth"), 401
-    return jsonify(ok=True, items=list(DECISIONS))
 
 @app.route('/live_trade', methods=['POST'])
 def live_trade():
