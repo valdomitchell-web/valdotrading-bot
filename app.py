@@ -41,8 +41,12 @@ db = SQLAlchemy(app)
 
 load_dotenv(override=False)  # don't override Render env vars with .env
 
-app.config["USE_US"]  = env_true("BINANCE_US")          # False => .com, True => .us
-app.config["TESTNET"] = env_true("BINANCE_TESTNET")     # True => testnet
+def env_true(name, default="false"):
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+
+app.config.setdefault("USE_US", env_true("BINANCE_US", "false"))
+app.config.setdefault("TESTNET", env_true("BINANCE_TESTNET", "false"))
+
 
 # --- Nonce-based CSP (drop-in) ---
 def _csp_nonce():
