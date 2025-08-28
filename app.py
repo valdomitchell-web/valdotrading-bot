@@ -576,19 +576,20 @@ def auto_loop():
                                 sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
                             ) if fills else price
 
-                           try:
-                                db.session.add(Trade(symbol=sym, side="BUY", amount=float(filled_qty),
-                                                     price=float(avg_price), timestamp=datetime.utcnow(),
-                                                     is_open=False, source="auto"))
-                                db.session.commit()
+                        try:
+                            db.session.add(Trade(symbol=sym, side="BUY", amount=float(filled_qty),
+                            price=float(avg_price), timestamp=datetime.utcnow(),
+                            is_open=False, source="auto"))
+                            
+                            db.session.commit()
                             except Exception:
-                                db.session.rollback()
+                            db.session.rollback()
+                            
                             # ensure a DB position exists/updates avg price
                             pos = ensure_position_on_buy(sym, filled_qty, avg_price)
                             # record order locally for the dashboard
                             record_order_row(o, 'BUY', sym, float(filled_qty), float(avg_price), position_id=(pos.id if pos else None))
 
-                        
                             app.logger.info("[AUTO] BUY %s qty=%.8f @ %.2f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
                             decided.update({"action": "BUY", "reason": "signal"})
                         except BinanceAPIException as e:
