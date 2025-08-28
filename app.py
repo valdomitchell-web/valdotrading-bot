@@ -25,6 +25,7 @@ from werkzeug.security import generate_password_hash
 from secrets import token_urlsafe
 from threading import Event, Thread
 from collections import deque
+from types import SimpleNamespace
 
 
 # =========================
@@ -2245,10 +2246,48 @@ def home():
 def dashboard():
     if 'user_id' not in session:
         return redirect(url_for('login'))
+
     trades = Trade.query.order_by(Trade.timestamp.desc()).limit(50).all()
     positions_open = Position.query.filter_by(status='OPEN').all()
-    positions_closed = Position.query.filter_by(status='CLOSED').order_by(Position.closed_at.desc()).limit(50).all()
-    orders_open = Order.query.filter(Order.status.in_(['NEW','PARTIALLY_FILLED'])).order_by(Order.created_at.desc()).limit(50).all()
+    positions_closed = (Position.query.filter_by(status='CLOSED')
+                        .order_by(Position.closed_at.desc()).limit(50).all())
+    orders_open = (Order.query.filter(Order.status.in_(['NEW','PARTIALLY_FILLED']))
+                   .order_by(Order.created_at.desc()).limit(50).all())
+
+    # If DB has no open positions, fall back to live balances for AUTO_SYMBOLS
+    used_live_fallback = False
+    if not positions_open:
+        try:
+            c = make_client()
+            acct = c.get_account()
+            bals = {b["asset"]: float(b["free"]) for b in acct["balances"] if float(b["free"]) > 0}
+            live_positions = []
+            symbols = (AUTO_SYMBOLS or ["BTCUSDT"])
+            for sym in symbols:
+                if not sym.endswith("USDT"):
+                    continue
+                base = sym[:-4]
+                qty = float(bals.get(base, 0.0))
+                if qty <= 0:
+                    continue
+                price = float(c.get_symbol_ticker(symbol=sym)["price"])
+                # Mimic the Position model fields the template already uses
+                live_positions.append(SimpleNamespace(
+                    id=None,
+                    symbol=sym,
+                    side='LONG',
+                    qty=qty,
+                    avg_price=price,      # unknown true entry; use current so PnL≈0
+                    opened_at=None,
+                    closed_at=None,
+                    status='OPEN',
+                    realized_pnl=0.0
+                ))
+            if live_positions:
+                positions_open = live_positions
+                used_live_fallback = True
+        except Exception as e:
+            app.logger.warning("live positions fallback failed: %s", e)
 
     def current_price(sym):
         try:
@@ -2258,7 +2297,9 @@ def dashboard():
             return 0.0
 
     realized = sum((p.realized_pnl or 0.0) for p in positions_closed)
-    unrealized = sum((current_price(p.symbol) - (p.avg_price or 0.0)) * (p.qty or 0.0) for p in positions_open)
+    # For live-fallback rows avg_price == current, so unrealized≈0 (by design)
+    unrealized = sum((current_price(p.symbol) - (p.avg_price or 0.0)) * (p.qty or 0.0)
+                     for p in positions_open)
 
     return render_template(
         'dashboard.html',
@@ -2270,9 +2311,10 @@ def dashboard():
         pnl_unrealized=unrealized,
         auto_sync_enabled=_AUTO_SYNC_ENABLED,
         auto_sync_interval=AUTO_SYNC_INTERVAL_S,
-        trailing_cfg=load_trailing_cfg_dict()
+        trailing_cfg=load_trailing_cfg_dict(),
+        live_fallback=used_live_fallback  # extra context (template doesn’t need to use it)
     )
-    
+
 # ============== Paper trading monitor (unchanged) ==============
 def monitor_trades():
     with app.app_context():
