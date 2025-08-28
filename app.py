@@ -372,6 +372,9 @@ RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
 BUY_RSI_MAX  = float(os.getenv("BUY_RSI_MAX", "60"))  # cap to avoid overbought
 SELL_RSI_MIN = float(os.getenv("SELL_RSI_MIN", "40")) # avoid panic exits in chop
 
+ALLOW_TREND_ENTRY = env_true("ALLOW_TREND_ENTRY", "false")  # allow buy when fast>slow even without a new cross
+ALLOW_TREND_EXIT  = env_true("ALLOW_TREND_EXIT",  "false")  # allow sell when fast<slow even without a new cross
+
 # Runner state
 _auto = {"thread": None, "stop": Event(), "enabled": False, "last": None, "err": None, "last_trade_ts": {}}
 
@@ -564,8 +567,14 @@ def auto_loop():
                 q1, q2 = es[-2], es[-1]
                 rsi_now = rsi_vals[-1] if rsi_vals[-1] is not None else 50.0
 
-                bull_x = (p1 is not None and q1 is not None and p1 <= q1 and p2 > q2)
-                bear_x = (p1 is not None and q1 is not None and p1 >= q1 and p2 < q2)
+                bull_cross = crossed_up(p1, p2, q1, q2)
+                bear_cross = crossed_down(p1, p2, q1, q2)
+
+                trend_up = (p2 > q2)
+                trend_dn = (p2 < q2)
+
+                bull_x = bull_cross or (ALLOW_TREND_ENTRY and trend_up)
+                bear_x = bear_cross or (ALLOW_TREND_EXIT  and trend_dn)
 
                 acct = client.get_account()
                 bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
