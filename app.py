@@ -1494,6 +1494,76 @@ def _trailing_manager_loop():
 # start trailing loop once
 threading.Thread(target=_trailing_manager_loop, daemon=True).start()
 
+# --- one-off dry run (no trading) -------------------------------------------
+from datetime import datetime  # if not already imported
+
+@app.get("/auto/step")
+def auto_step():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+
+    client = make_client()
+    items = []
+
+    try:
+        acct = client.get_account()
+        bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+    except Exception as e:
+        return jsonify(ok=False, error=f"account: {e}")
+
+    # fallbacks if these knobs weren't defined
+    allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
+    allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
+
+    for sym in AUTO_SYMBOLS:
+        try:
+            kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
+            if not kl:
+                items.append({"symbol": sym, "error": "no klines"})
+                continue
+
+            closes, ef, es, r = last_close_and_indicators(kl)
+            p1, p2 = ef[-2], ef[-1]
+            q1, q2 = es[-2], es[-1]
+            rsi_now = r[-1] if r[-1] is not None else 50.0
+
+            bull_cross = (p1 <= q1 and p2 > q2)
+            bear_cross = (p1 >= q1 and p2 < q2)
+            trend_up   = (p2 > q2)
+            trend_dn   = (p2 < q2)
+
+            bull_x = bull_cross or (allow_entry and trend_up)
+            bear_x = bear_cross or (allow_exit  and trend_dn)
+
+            price = float(client.get_symbol_ticker(symbol=sym)["price"])
+            base = sym.replace("USDT","")
+            base_bal = bals.get(base, 0.0)
+
+            _, min_notional = symbol_filters(client, sym)
+
+            action = "HOLD"
+            reason = "no-cross"
+            if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
+                action, reason = "BUY", "signal"
+            elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
+                action, reason = "SELL", "signal"
+            elif base_bal * price >= min_notional:
+                reason = "have-base"
+
+            items.append({
+                "symbol": sym,
+                "ef": round(p2, 6), "es": round(q2, 6),
+                "rsi": round(rsi_now, 2),
+                "action": action, "reason": reason,
+                "ts": datetime.utcnow().isoformat()
+            })
+        except Exception as e:
+            items.append({"symbol": sym, "error": str(e)})
+
+    return jsonify(ok=True, items=items)
+# ---------------------------------------------------------------------------
+
+
 # ============== Diagnostics / utils routes ==============
 @app.route('/binance_diag')
 def binance_diag():
