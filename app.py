@@ -487,150 +487,139 @@ def log_decision(sym, ema_fast_v, ema_slow_v, rsi_now, action, reason):
 
 # --- main loop ---
 def auto_loop():
-    client = make_client()
-    app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f USDT", AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
+    # run the whole worker inside a Flask app context so db.session works
+    with app.app_context():
+        client = make_client()
+        app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f USDT",
+                        AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
 
-    _auto["last"] = datetime.utcnow().isoformat()
-
-    # cache filters per symbol: (step_str, min_qty_str, min_notional)
-    try:
-        flt = {s: symbol_filters(client, s) for s in AUTO_SYMBOLS}
-    except Exception as e:
-        _auto["err"] = f"filters: {e}"
-        app.logger.exception("[AUTO] symbol_filters error")
-        return
-
-    allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
-    allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
-
-    while not _auto["stop"].is_set():
         _auto["last"] = datetime.utcnow().isoformat()
 
+        # cache exchange filters: (step_str, min_qty_str, min_notional)
         try:
-            acct = client.get_account()
-            bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+            flt = {s: symbol_filters(client, s) for s in AUTO_SYMBOLS}
         except Exception as e:
-            _auto["err"] = f"account: {e}"
-            app.logger.warning("[AUTO] account error: %s", e)
-            _auto["stop"].wait(10)
-            continue
+            _auto["err"] = f"filters: {e}"
+            app.logger.exception("[AUTO] symbol_filters error")
+            return
 
-        for sym in AUTO_SYMBOLS:
+        allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
+        allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
+
+        while not _auto["stop"].is_set():
+            _auto["last"] = datetime.utcnow().isoformat()
+
             try:
-                if not can_trade(sym):
-                    if "decisions" in _auto:
-                        _auto["decisions"].append({
-                            "symbol": sym, "action": "HOLD", "reason": "cooldown",
-                            "ts": datetime.utcnow().isoformat()
-                        })
-                    continue
-
-                kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
-                if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
-                    if "decisions" in _auto:
-                        _auto["decisions"].append({
-                            "symbol": sym, "action": "HOLD", "reason": "few-bars",
-                            "ts": datetime.utcnow().isoformat()
-                        })
-                    continue
-
-                closes, ef, es, r = last_close_and_indicators(kl)
-                p1, p2 = ef[-2], ef[-1]
-                q1, q2 = es[-2], es[-1]
-                rsi_now = r[-1] if r[-1] is not None else 50.0
-
-                bull_cross = (p1 <= q1 and p2 > q2)
-                bear_cross = (p1 >= q1 and p2 < q2)
-                trend_up   = (p2 > q2)
-                trend_dn   = (p2 < q2)
-
-                bull_x = bull_cross or (allow_entry and trend_up)
-                bear_x = bear_cross or (allow_exit  and trend_dn)
-
-                price = float(client.get_symbol_ticker(symbol=sym)["price"])
-                base = sym.replace("USDT","")
-                base_bal = bals.get(base, 0.0)
-
-                # ⬇️ 3-tuple now
-                step_str, min_qty_str, min_notional = flt[sym]
-
-                decided = {"symbol": sym, "ef": round(p2,6), "es": round(q2,6),
-                           "rsi": round(rsi_now,2), "ts": datetime.utcnow().isoformat()}
-
-                # ---- BUY ----
-                if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
-                    qty_raw = AUTO_RISK_USDT / price
-                    qty_str = qty_to_str(qty_raw, step_str, min_qty_str)
-                    notional = Decimal(qty_str) * Decimal(str(price))
-                    if notional >= Decimal(str(min_notional)) and Decimal(qty_str) > 0:
-                        o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
-                        record_trade_ts(sym)
-
-                        filled_qty = float(o.get("executedQty") or 0.0)
-                        if filled_qty == 0.0 and o.get("fills"):
-                            filled_qty = sum(float(f["qty"]) for f in o["fills"])
-                        avg_price = (
-                            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / max(filled_qty, 1e-12)
-                            if o.get("fills") else price
-                        )
-                        try:
-                            db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
-                                                 timestamp=datetime.utcnow(), is_open=False, source="auto"))
-                            db.session.commit()
-                        except Exception:
-                            db.session.rollback()
-                        app.logger.info("[AUTO] BUY %s qty=%s @ %.2f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
-                        decided.update({"action":"BUY","reason":"signal"})
-                    else:
-                        decided.update({"action":"HOLD","reason":"qty-too-small"})
-
-                # ---- SELL ----
-                elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
-                    sell_qty_str = qty_to_str(base_bal, step_str, min_qty_str)
-                    notional = Decimal(sell_qty_str) * Decimal(str(price))
-                    if notional >= Decimal(str(min_notional)) and Decimal(sell_qty_str) > 0:
-                        o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=sell_qty_str)
-                        record_trade_ts(sym)
-
-                        filled_qty = float(o.get("executedQty") or 0.0)
-                        if filled_qty == 0.0 and o.get("fills"):
-                            filled_qty = sum(float(f["qty"]) for f in o["fills"])
-                        avg_price = (
-                            sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / max(filled_qty, 1e-12)
-                            if o.get("fills") else price
-                        )
-                        try:
-                            db.session.add(Trade(symbol=sym, side="SELL", amount=filled_qty, price=avg_price,
-                                                 timestamp=datetime.utcnow(), is_open=False, source="auto"))
-                            db.session.commit()
-                        except Exception:
-                            db.session.rollback()
-                        app.logger.info("[AUTO] SELL %s qty=%s @ %.2f | rsi=%.1f", sym, sell_qty_str, avg_price, rsi_now)
-                        decided.update({"action":"SELL","reason":"signal"})
-                    else:
-                        decided.update({"action":"HOLD","reason":"qty-too-small"})
-
-                else:
-                    decided.update({
-                        "action":"HOLD",
-                        "reason":"have-base" if (base_bal*price >= min_notional) else "no-cross"
-                    })
-
-                if "decisions" not in _auto:
-                    from collections import deque
-                    _auto["decisions"] = deque(maxlen=50)
-                _auto["decisions"].append(decided)
-
-            except BinanceAPIException as e:
-                _auto["err"] = str(e)
-                app.logger.warning("[AUTO] %s error: %s", sym, e)
+                acct = client.get_account()
+                bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
             except Exception as e:
-                _auto["err"] = str(e)
-                app.logger.exception("[AUTO] %s exception", sym)
+                _auto["err"] = f"account: {e}"
+                app.logger.warning("[AUTO] account error: %s", e)
+                _auto["stop"].wait(10)
+                continue
 
-        _auto["stop"].wait(30)
+            for sym in AUTO_SYMBOLS:
+                try:
+                    if not can_trade(sym):
+                        # optional: you can log a HOLD here if you want, but we skip to avoid None indicators
+                        continue
 
-    app.logger.info("[AUTO] stopped")
+                    kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
+                    if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
+                        # same note as above: skip logging when indicators aren’t ready
+                        continue
+
+                    closes = [float(k[4]) for k in kl]
+                    ef = ema(closes, EMA_FAST)
+                    es = ema(closes, EMA_SLOW)
+                    r  = rsi(closes, RSI_LEN)
+                    p1, p2 = ef[-2], ef[-1]
+                    q1, q2 = es[-2], es[-1]
+                    rsi_now = r[-1] if r[-1] is not None else 50.0
+
+                    bull_cross = (p1 <= q1 and p2 > q2)
+                    bear_cross = (p1 >= q1 and p2 < q2)
+                    trend_up   = (p2 > q2)
+                    trend_dn   = (p2 < q2)
+                    bull_x = bull_cross or (allow_entry and trend_up)
+                    bear_x = bear_cross or (allow_exit  and trend_dn)
+
+                    price = float(client.get_symbol_ticker(symbol=sym)["price"])
+                    base  = sym.replace("USDT","")
+                    base_bal = bals.get(base, 0.0)
+
+                    step_str, min_qty_str, min_notional = flt[sym]
+
+                    action = "HOLD"
+                    reason = "no-cross"
+
+                    # BUY
+                    if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
+                        qty_raw = AUTO_RISK_USDT / price
+                        qty_str = qty_to_str(qty_raw, step_str, min_qty_str)
+                        notional = Decimal(qty_str) * Decimal(str(price))
+                        if notional >= Decimal(str(min_notional)) and Decimal(qty_str) > 0:
+                            o = client.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
+                            record_trade_ts(sym)
+                            filled_qty = float(o.get("executedQty") or 0.0)
+                            if filled_qty == 0.0 and o.get("fills"):
+                                filled_qty = sum(float(f["qty"]) for f in o["fills"])
+                            avg_price = (
+                                sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / max(filled_qty, 1e-12)
+                                if o.get("fills") else price
+                            )
+                            try:
+                                db.session.add(Trade(symbol=sym, side="BUY", amount=filled_qty, price=avg_price,
+                                                     timestamp=datetime.utcnow(), is_open=False, source="auto"))
+                                db.session.commit()
+                            except Exception:
+                                db.session.rollback()
+                            app.logger.info("[AUTO] BUY %s qty=%s @ %.2f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
+                            action, reason = "BUY", "signal"
+                        else:
+                            reason = "qty-too-small"
+
+                    # SELL
+                    elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
+                        sell_qty_str = qty_to_str(base_bal, step_str, min_qty_str)
+                        notional = Decimal(sell_qty_str) * Decimal(str(price))
+                        if notional >= Decimal(str(min_notional)) and Decimal(sell_qty_str) > 0:
+                            o = client.create_order(symbol=sym, side="SELL", type="MARKET", quantity=sell_qty_str)
+                            record_trade_ts(sym)
+                            filled_qty = float(o.get("executedQty") or 0.0)
+                            if filled_qty == 0.0 and o.get("fills"):
+                                filled_qty = sum(float(f["qty"]) for f in o["fills"])
+                            avg_price = (
+                                sum(float(f["price"])*float(f["qty"]) for f in o.get("fills", [])) / max(filled_qty, 1e-12)
+                                if o.get("fills") else price
+                            )
+                            try:
+                                db.session.add(Trade(symbol=sym, side="SELL", amount=filled_qty, price=avg_price,
+                                                     timestamp=datetime.utcnow(), is_open=False, source="auto"))
+                                db.session.commit()
+                            except Exception:
+                                db.session.rollback()
+                            app.logger.info("[AUTO] SELL %s qty=%s @ %.2f | rsi=%.1f", sym, sell_qty_str, avg_price, rsi_now)
+                            action, reason = "SELL", "signal"
+                        else:
+                            reason = "qty-too-small"
+                    else:
+                        if base_bal * price >= min_notional:
+                            reason = "have-base"
+
+                    # Write to the global DECISIONS deque (what /auto/decisions returns)
+                    log_decision(sym, p2, q2, rsi_now, action, reason)
+
+                except BinanceAPIException as e:
+                    _auto["err"] = str(e)
+                    app.logger.warning("[AUTO] %s error: %s", sym, e)
+                except Exception as e:
+                    _auto["err"] = str(e)
+                    app.logger.exception("[AUTO] %s exception", sym)
+
+            _auto["stop"].wait(30)
+
+        app.logger.info("[AUTO] stopped")
 
 
 # --- routes ---
