@@ -689,8 +689,30 @@ def auto_loop():
 def _auto_thread_entry():
     with app.app_context():
         auto_loop()
+        
+# --- route safety helper (put this once, above your /auto routes) ---
+def _safe_route(endpoint: str):
+    """If an endpoint already exists (from an older block), remove it so we can re-register."""
+    try:
+        if endpoint in app.view_functions:
+            app.logger.warning("Replacing existing endpoint: %s", endpoint)
+            # Remove rules mapped to this endpoint to avoid duplicates
+            try:
+                to_remove = [r for r in list(app.url_map.iter_rules()) if r.endpoint == endpoint]
+                for r in to_remove:
+                    app.url_map._rules.remove(r)
+                    app.url_map._rules_by_endpoint[r.endpoint].remove(r)
+                if endpoint in app.url_map._rules_by_endpoint and not app.url_map._rules_by_endpoint[endpoint]:
+                    del app.url_map._rules_by_endpoint[endpoint]
+            except Exception:
+                # Best-effort cleanup; even just popping the view func is enough to rebind
+                pass
+            app.view_functions.pop(endpoint, None)
+    except Exception:
+        pass
 
 # --- routes ---
+_safe_route('auto_status')
 @app.get("/auto/status")
 def auto_status():
     return jsonify(
@@ -700,7 +722,7 @@ def auto_status():
         last=_auto["last"],
         err=_auto["err"],
     )
-
+_safe_route('auto_start')
 @app.post("/auto/start")
 def auto_start():
     if not require_admin():
@@ -713,7 +735,8 @@ def auto_start():
     _auto["thread"] = th
     th.start()
     return jsonify(ok=True, running=True)
-
+    
+_safe_route('auto_stop')
 @app.post("/auto/stop")
 def auto_stop():
     if not require_admin():
@@ -721,7 +744,8 @@ def auto_stop():
     _auto["enabled"] = False
     _auto["stop"].set()
     return jsonify(ok=True)
-
+    
+_safe_route('auto_decisions')
 @app.get("/auto/decisions")
 def auto_decisions():
     if not (session.get("user_id") or session.get("logged_in") or
@@ -730,6 +754,7 @@ def auto_decisions():
     return jsonify(ok=True, items=list(DECISIONS))
 
 # Quick dry-run / diagnostics (no trading): shows what the loop would do right now.
+_safe_route('auto_step')
 @app.get("/auto/step")
 def auto_step():
     if not require_admin():
@@ -794,6 +819,7 @@ def auto_step():
     return jsonify(ok=True, items=items)
 
 # Replace your existing /debug/live_buy with this version (uses global qty_to_str)
+_safe_route('debug_live_buy')
 @app.post("/debug/live_buy")
 def debug_live_buy():
     if not require_admin():
@@ -838,7 +864,6 @@ def debug_live_buy():
         return jsonify(ok=False, error=str(e)), 500
 
 # ============== END of auto trader ==============
-
 
 @app.get("/balances_live")
 def balances_live():
