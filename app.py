@@ -624,7 +624,14 @@ def auto_loop():
                                     db.session.commit()
                                 except Exception:
                                     db.session.rollback()
+                                # ... inside SELL branch, after avg_price is computed
+                                pos = Position.query.filter_by(symbol=sym, status='OPEN').first()
 
+                                # record order locally for the dashboard (attach to position if present)
+                                record_order_row(
+                                    o, 'SELL', sym, float(filled_qty), float(avg_price),
+                                    position_id=(pos.id if pos else None)
+                                )
                                 # record order locally for the dashboard
                                 record_order_row(o, 'SELL', sym, float(filled_qty), float(avg_price), position_id=None)
                                 # try to close any matching open position once sufficiently sold
@@ -1142,19 +1149,37 @@ def close_position_if_filled_sells(symbol: str):
     pos = Position.query.filter_by(symbol=symbol, status='OPEN').first()
     if not pos:
         return
-    sell_orders = Order.query.filter_by(position_id=pos.id, side='SELL', status='FILLED').all()
+
+    # include ALL FILLED sells for this symbol (older ones may not be linked)
+    sell_orders = Order.query.filter_by(symbol=symbol, side='SELL', status='FILLED').all()
     closed_qty  = sum(float(o.qty or 0.0) for o in sell_orders)
-    if closed_qty + 1e-12 >= float(pos.qty or 0.0) and float(pos.qty or 0.0) > 0:
+
+    # tolerances: treat as closed if remainder is below step or minNotional
+    try:
+        f = get_symbol_filters(get_binance_client(), symbol)
+        step = float(f["stepSize"])
+        min_notional = float(f["minNotional"])
+        price = float(get_binance_price(symbol) or pos.avg_price or 0.0)
+    except Exception:
+        step = 0.0
+        min_notional = 0.0
+        price = float(pos.avg_price or 0.0)
+
+    remaining = max(0.0, float(pos.qty or 0.0) - closed_qty)
+    tiny = (remaining <= step * 1.5) or (remaining * max(price, 0.0) < min_notional)
+
+    if closed_qty + 1e-12 >= float(pos.qty or 0.0) or tiny:
+        qty_used = min(closed_qty, float(pos.qty or 0.0)) or float(pos.qty or 0.0)
         total_val = sum(float(o.qty or 0.0) * float(o.price or 0.0) for o in sell_orders)
-        avg_exit  = (total_val / closed_qty) if closed_qty > 0 else pos.avg_price
-        pnl       = (avg_exit - float(pos.avg_price or 0.0)) * float(pos.qty or 0.0)
+        avg_exit  = (total_val / closed_qty) if closed_qty > 0 else float(pos.avg_price or 0.0)
+        pnl       = (float(avg_exit) - float(pos.avg_price or 0.0)) * qty_used
+
         pos.realized_pnl = float(pnl)
         pos.status       = 'CLOSED'
         pos.closed_at    = datetime.utcnow()
         db.session.commit()
         try:
-            opens = Trade.query.filter_by(symbol=symbol, is_open=True).all()
-            for t in opens:
+            for t in Trade.query.filter_by(symbol=symbol, is_open=True).all():
                 t.is_open = False
             db.session.commit()
         except Exception:
@@ -1884,7 +1909,9 @@ def live_trade():
             pos = ensure_position_on_buy(symbol, fqty, fprice)
             pos_id = pos.id
 
-        record_order_row(order, side, symbol, float(fqty or 0.0), float(fprice or 0.0), pos_id)
+        pos = Position.query.filter_by(symbol=symbol, status='OPEN').first()
+        record_order_row(order, 'SELL', symbol, float(fqty), float(fprice), position_id=(pos.id if pos else None))
+
 
         if side == 'SELL':
             close_position_if_filled_sells(symbol)
@@ -1972,7 +1999,8 @@ def signal():
             except Exception:
                 db.session.rollback()
 
-            record_order_row(order, 'SELL', symbol, float(fqty), float(fprice), position_id=None)
+            pos = Position.query.filter_by(symbol=symbol, status='OPEN').first()
+            record_order_row(order, 'SELL', symbol, float(fqty), float(fprice), position_id=(pos.id if pos else None))
             close_position_if_filled_sells(symbol)
             return jsonify({"status": "success", "order": order})
 
