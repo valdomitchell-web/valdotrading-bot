@@ -34,12 +34,6 @@ from types import SimpleNamespace
 load_dotenv()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-fallback')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')  # e.g. postgresql://user:pass@localhost:5432/Thone
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
-
-load_dotenv(override=False)  # don't override Render env vars with .env
 
 def env_true(name, default="false"):
     return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
@@ -47,6 +41,12 @@ def env_true(name, default="false"):
 app.config.setdefault("USE_US", env_true("BINANCE_US", "false"))
 app.config.setdefault("TESTNET", env_true("BINANCE_TESTNET", "false"))
 
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-fallback')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')  # e.g. postgresql://user:pass@localhost:5432/Thone
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+load_dotenv(override=False)  # don't override Render env vars with .env
 
 # --- Nonce-based CSP (drop-in) ---
 def _csp_nonce():
@@ -489,12 +489,24 @@ def auto_loop():
                         AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
 
         # cache filters once
-        try:
-            flt = {s: symbol_filters(client, s) for s in AUTO_SYMBOLS}
-        except Exception as e:
-            _auto["err"] = f"filters: {e}"
-            app.logger.exception("[AUTO] symbol_filters error")
-            return
+        # cache filters once (tolerate invalid symbols)
+flt = {}
+bad = []
+for s in AUTO_SYMBOLS:
+    try:
+        info = client.get_symbol_info(s)
+        if not info or not info.get("filters"):
+            bad.append(s)
+            continue
+        flt[s] = symbol_filters(client, s)
+    except Exception as e:
+        bad.append(s)
+        continue
+
+if bad:
+    _auto["err"] = f"skipping invalid symbols: {','.join(bad)}"
+    app.logger.warning("[AUTO] skipping invalid symbols: %s", bad)
+
 
         allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
         allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
@@ -539,7 +551,12 @@ def auto_loop():
                     price = float(client.get_symbol_ticker(symbol=sym)["price"])
                     base = sym.replace("USDT", "")
                     base_bal = bals.get(base, 0.0)
-                    step_str, min_qty_str, min_notional = flt[sym]
+                    f = flt.get(sym)
+if not f:
+    log_decision(sym, None, None, None, "HOLD", "invalid-symbol")
+    continue
+step_str, min_qty_str, min_notional = f
+
 
                     # -------------------- BUY (use quoteOrderQty) --------------------
                     if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
