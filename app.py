@@ -906,6 +906,71 @@ def infer_source_from_request(req, default='manual'):
         return 'webhook'
     return default
 
+@app.post("/positions/reconcile")
+def positions_reconcile():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+
+    closed = 0
+    linked = 0
+    details = []
+
+    c = get_binance_client()
+    for pos in Position.query.filter_by(status='OPEN').all():
+        sym = pos.symbol
+        try:
+            f = get_symbol_filters(c, sym)
+            step = float(f["stepSize"])
+            min_notional = float(f["minNotional"])
+        except Exception:
+            step = 0.0
+            min_notional = 0.0
+
+        price_now = float(get_binance_price(sym) or pos.avg_price or 0.0)
+
+        # All filled sells for this symbol since this position opened
+        sells = (
+            Order.query
+            .filter_by(symbol=sym, side='SELL', status='FILLED')
+            .filter(Order.created_at >= (pos.opened_at or datetime.min))
+            .all()
+        )
+
+        # Backfill position_id on any unlinked sells
+        for o in sells:
+            if o.position_id is None:
+                o.position_id = pos.id
+                linked += 1
+        db.session.commit()
+
+        sold_qty = sum(float(o.qty or 0.0) for o in sells)
+        remaining = max(0.0, float(pos.qty or 0.0) - sold_qty)
+        tiny = (remaining <= step * 1.5) or (remaining * price_now < min_notional)
+
+        if sold_qty > 0 and (sold_qty + 1e-12 >= float(pos.qty or 0.0) or tiny):
+            total_val = sum(float(o.qty or 0.0) * float(o.price or 0.0) for o in sells)
+            avg_exit = total_val / max(sold_qty, 1e-12)
+            pnl = (avg_exit - float(pos.avg_price or 0.0)) * float(pos.qty or 0.0)
+
+            pos.realized_pnl = float(pnl)
+            pos.status = 'CLOSED'
+            pos.closed_at = datetime.utcnow()
+            db.session.commit()
+
+            # mark any lingering open trades as closed
+            try:
+                for t in Trade.query.filter_by(symbol=sym, is_open=True).all():
+                    t.is_open = False
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+
+            closed += 1
+            details.append({"symbol": sym, "sold_qty": sold_qty, "avg_exit": avg_exit, "pnl": pnl})
+
+    return jsonify(ok=True, linked=linked, closed=closed, details=details)
+
+
 # ============== Risk / guardrails ==============
 _last_signal_at: dict[str, float] = {}  # symbol -> epoch seconds
 
@@ -1351,7 +1416,14 @@ def sync_open_core(symbol: str | None = None) -> dict:
         # 3) Auto-close if filled SELLs cover the open position
         pos = Position.query.filter_by(symbol=sym, status='OPEN').first()
         if pos:
-            sell_filled = Order.query.filter_by(symbol=sym, side='SELL', status='FILLED').all()
+            from datetime import datetime  # top of file already has it, just ensure imported
+
+            sell_filled = (
+                Order.query
+                .filter_by(symbol=sym, side='SELL', status='FILLED')
+                .filter(Order.created_at >= (pos.opened_at or datetime.min))
+                .all()
+            )
             total_sell_qty = sum(float(o.qty or 0.0) for o in sell_filled)
 
             if total_sell_qty + 1e-12 >= float(pos.qty or 0.0) and float(pos.qty or 0.0) > 0:
