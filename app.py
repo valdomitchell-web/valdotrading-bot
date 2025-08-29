@@ -486,31 +486,28 @@ def auto_loop():
         client = make_client()
         app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f USDT",
                         AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
-
-        # cache filters once
+        
         # cache filters once (tolerate invalid symbols)
-flt = {}
-bad = []
-for s in AUTO_SYMBOLS:
-    try:
-        info = client.get_symbol_info(s)
-        if not info or not info.get("filters"):
-            bad.append(s)
-            continue
-        flt[s] = symbol_filters(client, s)
-    except Exception as e:
-        bad.append(s)
-        continue
+        flt = {}
+        bad = []
+        for s in AUTO_SYMBOLS:
+            try:
+                info = client.get_symbol_info(s)
+                if not info or not info.get("filters"):
+                    bad.append(s)
+                    continue
+                flt[s] = symbol_filters(client, s)
+            except Exception as e:
+                bad.append(s)
+                continue
+        if bad:
+            _auto["err"] = f"skipping invalid symbols: {','.join(bad)}"
+            app.logger.warning("[AUTO] skipping invalid symbols: %s", bad)
 
-if bad:
-    _auto["err"] = f"skipping invalid symbols: {','.join(bad)}"
-    app.logger.warning("[AUTO] skipping invalid symbols: %s", bad)
+           allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
+           allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
-
-        allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
-        allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
-
-        while not _auto["stop"].is_set():
+            while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
 
             # account balances (for "already holding?" logic)
@@ -551,11 +548,10 @@ if bad:
                     base = sym.replace("USDT", "")
                     base_bal = bals.get(base, 0.0)
                     f = flt.get(sym)
-if not f:
-    log_decision(sym, None, None, None, "HOLD", "invalid-symbol")
-    continue
-step_str, min_qty_str, min_notional = f
-
+                    if not f:
+                        log_decision(sym, None, None, None, "HOLD", "invalid-symbol")
+                        continue
+                    step_str, min_qty_str, min_notional = f
 
                     # -------------------- BUY (use quoteOrderQty) --------------------
                     if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
