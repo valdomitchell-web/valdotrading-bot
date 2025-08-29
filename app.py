@@ -877,7 +877,8 @@ def is_authorized(req) -> bool:
     header_key = req.headers.get("X-API-KEY")
     if INTERNAL_API_KEY and header_key and header_key == INTERNAL_API_KEY:
         return True
-
+    if ADMIN_TOKEN and req.headers.get("X-Admin-Token") == ADMIN_TOKEN:
+        return True
     # NEW: accept TradingView secret via header, JSON body, or URL query
     if TRADINGVIEW_WEBHOOK_SECRET:
         if req.headers.get("X-Webhook-Secret") == TRADINGVIEW_WEBHOOK_SECRET:
@@ -911,64 +912,119 @@ def positions_reconcile():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
 
-    closed = 0
-    linked = 0
     details = []
+    closed = 0
+    linked = 0  # positions where we used trade fills to compute avg_exit
 
-    c = get_binance_client()
-    for pos in Position.query.filter_by(status='OPEN').all():
-        sym = pos.symbol
-        try:
-            f = get_symbol_filters(c, sym)
-            step = float(f["stepSize"])
-            min_notional = float(f["minNotional"])
-        except Exception:
-            step = 0.0
-            min_notional = 0.0
+    try:
+        open_positions = Position.query.filter_by(status='OPEN').all()
+        for pos in open_positions:
+            sym = (pos.symbol or "").upper()
+            qty_pos = float(pos.qty or 0.0)
+            if not sym or qty_pos <= 0:
+                continue
 
-        price_now = float(get_binance_price(sym) or pos.avg_price or 0.0)
+            opened_at = pos.opened_at or datetime.min
 
-        # All filled sells for this symbol since this position opened
-        sells = (
-            Order.query
-            .filter_by(symbol=sym, side='SELL', status='FILLED')
-            .filter(Order.created_at >= (pos.opened_at or datetime.min))
-            .all()
-        )
+            # ----- Primary source: Trade fills (authoritative for executed price) -----
+            trade_sells = (
+                Trade.query
+                .filter_by(symbol=sym, side='SELL')
+                .filter(Trade.timestamp >= opened_at)
+                .all()
+            )
+            sold_qty_t = sum(float(t.amount or 0.0) for t in trade_sells)
+            total_val_t = sum(float(t.amount or 0.0) * float(t.price or 0.0) for t in trade_sells)
+            avg_exit_t = (total_val_t / sold_qty_t) if sold_qty_t > 0 else None
 
-        # Backfill position_id on any unlinked sells
-        for o in sells:
-            if o.position_id is None:
-                o.position_id = pos.id
+            # ----- Fallback: Order rows (may have price==0 for MARKET) -----
+            order_sells = (
+                Order.query
+                .filter_by(symbol=sym, side='SELL', status='FILLED')
+                .filter(Order.created_at >= opened_at)
+                .all()
+            )
+            sold_qty_o = sum(float(o.qty or 0.0) for o in order_sells)
+            # only count value where price>0
+            total_val_o = sum(float(o.qty or 0.0) * float(o.price or 0.0) for o in order_sells if float(o.price or 0.0) > 0.0)
+            avg_exit_o = (total_val_o / sold_qty_o) if sold_qty_o > 0 and total_val_o > 0 else None
+
+            # ----- Choose source -----
+            used = None
+            if avg_exit_t is not None and avg_exit_t > 0:
+                avg_exit = float(avg_exit_t)
+                sold_qty = float(sold_qty_t)
+                used = "trades"
                 linked += 1
-        db.session.commit()
 
-        sold_qty = sum(float(o.qty or 0.0) for o in sells)
-        remaining = max(0.0, float(pos.qty or 0.0) - sold_qty)
-        tiny = (remaining <= step * 1.5) or (remaining * price_now < min_notional)
+                # best-effort: backfill zero-priced FILLED orders with trade avg_exit
+                try:
+                    updated_any = False
+                    for o in order_sells:
+                        if not o.price or float(o.price) == 0.0:
+                            o.price = avg_exit
+                            updated_any = True
+                    if updated_any:
+                        db.session.commit()
+                except Exception:
+                    db.session.rollback()
+            elif avg_exit_o is not None and avg_exit_o > 0:
+                avg_exit = float(avg_exit_o)
+                sold_qty = float(sold_qty_o)
+                used = "orders"
+            else:
+                details.append({
+                    "symbol": sym,
+                    "sold_qty": float(sold_qty_t or sold_qty_o or 0.0),
+                    "avg_exit": 0.0,
+                    "note": "no priced fills found"
+                })
+                continue
 
-        if sold_qty > 0 and (sold_qty + 1e-12 >= float(pos.qty or 0.0) or tiny):
-            total_val = sum(float(o.qty or 0.0) * float(o.price or 0.0) for o in sells)
-            avg_exit = total_val / max(sold_qty, 1e-12)
-            pnl = (avg_exit - float(pos.avg_price or 0.0)) * float(pos.qty or 0.0)
-
-            pos.realized_pnl = float(pnl)
-            pos.status = 'CLOSED'
-            pos.closed_at = datetime.utcnow()
-            db.session.commit()
-
-            # mark any lingering open trades as closed
-            try:
-                for t in Trade.query.filter_by(symbol=sym, is_open=True).all():
-                    t.is_open = False
+            # ----- Close if fully sold -----
+            EPS = 1e-12
+            if sold_qty + EPS >= qty_pos:
+                pnl = (avg_exit - float(pos.avg_price or 0.0)) * qty_pos
+                pos.realized_pnl = float(pnl)
+                pos.status = 'CLOSED'
+                pos.closed_at = datetime.utcnow()
                 db.session.commit()
-            except Exception:
-                db.session.rollback()
+                closed += 1
 
-            closed += 1
-            details.append({"symbol": sym, "sold_qty": sold_qty, "avg_exit": avg_exit, "pnl": pnl})
+                # Mark related trade rows not open (best effort)
+                try:
+                    for t in trade_sells:
+                        t.is_open = False
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
 
-    return jsonify(ok=True, linked=linked, closed=closed, details=details)
+                details.append({
+                    "symbol": sym,
+                    "sold_qty": round(sold_qty, 8),
+                    "avg_exit": round(avg_exit, 8),
+                    "pnl": round(float(pnl), 8),
+                    "used": used
+                })
+
+                # optional UI ping
+                try:
+                    notify_event("position_reconciled", {"symbol": sym, "pnl": float(pnl)})
+                except Exception:
+                    pass
+            else:
+                details.append({
+                    "symbol": sym,
+                    "sold_qty": round(sold_qty, 8),
+                    "avg_exit": round(avg_exit, 8),
+                    "remaining_qty": round(qty_pos - sold_qty, 8),
+                    "used": used
+                })
+
+        return jsonify(ok=True, closed=closed, linked=linked, details=details)
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(ok=False, error=str(e)), 500
 
 
 # ============== Risk / guardrails ==============
