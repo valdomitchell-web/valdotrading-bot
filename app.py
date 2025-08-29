@@ -484,9 +484,11 @@ def auto_loop():
     # All DB work in this thread happens under an app context
     with app.app_context():
         client = make_client()
-        app.logger.info("[AUTO] started | symbols=%s interval=%s risk=%.2f USDT",
-                        AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT)
-        
+        app.logger.info(
+            "[AUTO] started | symbols=%s interval=%s risk=%.2f USDT",
+            AUTO_SYMBOLS, AUTO_INTERVAL, AUTO_RISK_USDT
+        )
+
         # cache filters once (tolerate invalid symbols)
         flt = {}
         bad = []
@@ -497,17 +499,18 @@ def auto_loop():
                     bad.append(s)
                     continue
                 flt[s] = symbol_filters(client, s)
-            except Exception as e:
+            except Exception:
                 bad.append(s)
-                continue
+
+        valid_symbols = list(flt.keys())
         if bad:
             _auto["err"] = f"skipping invalid symbols: {','.join(bad)}"
             app.logger.warning("[AUTO] skipping invalid symbols: %s", bad)
 
-           allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
-           allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
+        allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
+        allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
-            while not _auto["stop"].is_set():
+        while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
 
             # account balances (for "already holding?" logic)
@@ -520,7 +523,12 @@ def auto_loop():
                 _auto["stop"].wait(10)
                 continue
 
-            for sym in AUTO_SYMBOLS:
+            if not valid_symbols:
+                log_decision("ALL", None, None, None, "HOLD", "no-valid-symbols")
+                _auto["stop"].wait(30)
+                continue
+
+            for sym in valid_symbols:
                 try:
                     if not can_trade(sym):
                         log_decision(sym, None, None, None, "HOLD", "cooldown")
@@ -547,11 +555,8 @@ def auto_loop():
                     price = float(client.get_symbol_ticker(symbol=sym)["price"])
                     base = sym.replace("USDT", "")
                     base_bal = bals.get(base, 0.0)
-                    f = flt.get(sym)
-                    if not f:
-                        log_decision(sym, None, None, None, "HOLD", "invalid-symbol")
-                        continue
-                    step_str, min_qty_str, min_notional = f
+
+                    step_str, min_qty_str, min_notional = flt[sym]
 
                     # -------------------- BUY (use quoteOrderQty) --------------------
                     if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
@@ -583,7 +588,8 @@ def auto_loop():
                             # ensure a DB position exists/updates avg price
                             pos = ensure_position_on_buy(sym, filled_qty, avg_price)
                             # record order locally for the dashboard
-                            record_order_row(o, 'BUY', sym, float(filled_qty), float(avg_price), position_id=(pos.id if pos else None))
+                            record_order_row(o, 'BUY', sym, float(filled_qty), float(avg_price),
+                                             position_id=(pos.id if pos else None))
 
                             app.logger.info("[AUTO] BUY %s qty=%.8f @ %.4f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
                             log_decision(sym, p2, q2, rsi_now, "BUY", "signal")
@@ -634,8 +640,11 @@ def auto_loop():
                             log_decision(sym, p2, q2, rsi_now, "HOLD", "qty-too-small")
 
                     else:
-                        log_decision(sym, p2, q2, rsi_now,
-                                     "HOLD", "have-base" if (base_bal * price >= min_notional) else "no-cross")
+                        log_decision(
+                            sym, p2, q2, rsi_now,
+                            "HOLD",
+                            "have-base" if (base_bal * price >= min_notional) else "no-cross"
+                        )
 
                 except BinanceAPIException as e:
                     _auto["err"] = str(e)
