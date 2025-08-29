@@ -34,19 +34,18 @@ from types import SimpleNamespace
 load_dotenv()
 
 app = Flask(__name__)
-
-def env_true(name, default="false"):
-    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
-
-app.config.setdefault("USE_US", env_true("BINANCE_US", "false"))
-app.config.setdefault("TESTNET", env_true("BINANCE_TESTNET", "false"))
-
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-fallback')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')  # e.g. postgresql://user:pass@localhost:5432/Thone
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 load_dotenv(override=False)  # don't override Render env vars with .env
+
+def env_true(name, default="false"):
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+
+app.config.setdefault("USE_US", env_true("BINANCE_US", "false"))
+app.config.setdefault("TESTNET", env_true("BINANCE_TESTNET", "false"))
 
 # --- Nonce-based CSP (drop-in) ---
 def _csp_nonce():
