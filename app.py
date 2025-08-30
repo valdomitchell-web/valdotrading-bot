@@ -363,6 +363,18 @@ SELL_RSI_MIN = float(os.getenv("SELL_RSI_MIN", "40"))
 ALLOW_TREND_ENTRY = env_true("ALLOW_TREND_ENTRY", "false")
 ALLOW_TREND_EXIT  = env_true("ALLOW_TREND_EXIT",  "false")
 
+CROSS_CONFIRM_BARS = int(os.getenv("CROSS_CONFIRM_BARS", "2"))   # require ef>es (or ef<es) for N closed bars
+EMA_SEP_BPS        = float(os.getenv("EMA_SEP_BPS", "8"))        # min EMA separation to act, in basis points (8 = 0.08%)
+
+# tighten RSI gates a bit to avoid selling into weakness & buying into strength
+BUY_RSI_MAX        = float(os.getenv("BUY_RSI_MAX", "55"))       # was 60
+SELL_RSI_MIN       = float(os.getenv("SELL_RSI_MIN", "45"))      # was 40
+
+# exposure guards
+PER_SYMBOL_MAX_USDT = float(os.getenv("PER_SYMBOL_MAX_USDT", "25"))   # cap per-symbol notional before allowing new buys
+AUTO_MAX_BUYS_PER_MIN = int(os.getenv("AUTO_MAX_BUYS_PER_MIN", "3"))  # throttle bursts on choppy bars
+
+
 # --- state & logs ---
 _auto = {"thread": None, "stop": Event(), "enabled": False, "last": None, "err": None, "last_trade_ts": {}}
 DECISIONS = deque(maxlen=200)
@@ -479,6 +491,19 @@ def log_decision(sym, ema_fast_v, ema_slow_v, rsi_now, action, reason):
     except Exception:
         pass
 
+def ema_sep_bps(ef_v, es_v):
+    return abs(ef_v - es_v) / max(es_v, 1e-12) * 10_000.0
+
+def confirmed_trend(ef, es, bars: int, side: str) -> bool:
+    """Ensure the EMAs have agreed for the last N closed bars to reduce fake crosses."""
+    if bars <= 0:
+        return True
+    rng = range(2, 2 + bars)  # use closed bars only ([-2], [-3], ...)
+    if side == "BUY":
+        return all(ef[-i] > es[-i] for i in rng)
+    else:
+        return all(ef[-i] < es[-i] for i in rng)
+
 # --- main loop ---
 def auto_loop():
     # All DB work in this thread happens under an app context
@@ -558,9 +583,27 @@ def auto_loop():
 
                     step_str, min_qty_str, min_notional = flt[sym]
 
+                   # --- churn guards ---
+                    sep_bps = ema_sep_bps(p2, q2)
+                    buy_ok  = bull_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "BUY")  and (sep_bps >= EMA_SEP_BPS)
+                    sell_ok = bear_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "SELL") and (sep_bps >= EMA_SEP_BPS)
+
+                    # --- exposure guards ---
+                    # cap per-symbol notional before adding more (prevents repeated DCA into chop)
+                    symbol_notional = base_bal * price
+                    under_cap = (symbol_notional < PER_SYMBOL_MAX_USDT)
+
+                    # simple burst throttle: no more than N buys per minute across all symbols
+                    now_min = int(time.time() // 60)
+                    _auto.setdefault("minute_buys", {})
+                    if _auto["minute_buys"].get("when") != now_min:
+                    _auto["minute_buys"] = {"when": now_min, "count": 0}
+                    can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
+
                     # -------------------- BUY (use quoteOrderQty) --------------------
-                    if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
+                    if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
                         spend = max(AUTO_RISK_USDT, min_notional)  # satisfy exchange min notional
+                        _auto["minute_buys"]["count"] += 1
                         try:
                             o = client.create_order(
                                 symbol=sym,
@@ -599,7 +642,7 @@ def auto_loop():
                             log_decision(sym, p2, q2, rsi_now, "HOLD", "api-error")
 
                     # -------------------- SELL (step-safe quantity) -------------------
-                    elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
+                    elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                         qty_str = qty_to_str(base_bal, step_str, min_qty_str)
                         if float(qty_str) * price >= min_notional and float(qty_str) > 0:
                             try:
@@ -770,11 +813,29 @@ def _auto_step_view():
             base_bal = bals.get(base, 0.0)
             _, _, min_notional = symbol_filters(client, sym)
 
+            # --- churn guards ---
+            sep_bps = ema_sep_bps(p2, q2)
+            buy_ok  = bull_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "BUY")  and (sep_bps >= EMA_SEP_BPS)
+            sell_ok = bear_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "SELL") and (sep_bps >= EMA_SEP_BPS)
+
+            # --- exposure guards ---
+            # cap per-symbol notional before adding more (prevents repeated DCA into chop)
+            symbol_notional = base_bal * price
+            under_cap = (symbol_notional < PER_SYMBOL_MAX_USDT)
+
+            # simple burst throttle: no more than N buys per minute across all symbols
+            now_min = int(time.time() // 60)
+            _auto.setdefault("minute_buys", {})
+            if _auto["minute_buys"].get("when") != now_min:
+            _auto["minute_buys"] = {"when": now_min, "count": 0}
+            can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
+    
             action = "HOLD"
             reason = "no-cross"
-            if bull_x and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional:
-                action, reason = "BUY", "signal"
-            elif bear_x and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
+           if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
+               _auto["minute_buys"]["count"] += 1 
+               action, reason = "BUY", "signal"
+            elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                 action, reason = "SELL", "signal"
             elif base_bal * price >= min_notional:
                 reason = "have-base"
