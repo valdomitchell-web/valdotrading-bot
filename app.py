@@ -784,15 +784,14 @@ def auto_loop():
                     base_bal = bals.get(base, 0.0)
 
                     step_str, min_qty_str, min_notional = flt[sym]
-
-                          # -------------------- NEW: PANIC + Trailing/TP/SL --------------------
+                        # -------------------- NEW: PANIC + Trailing/TP/SL --------------------
             try:
                 rsi_map = {}
                 if sym == "BTCUSDT":
                     rsi_map["BTCUSDT"] = rsi_now
                 if sym == "ETHUSDT":
                     rsi_map["ETHUSDT"] = rsi_now
-
+                    
                 if panic_check_and_maybe_trigger(rsi_map):
                     _auto["enabled"] = False  # block new BUYs
                     if PANIC_MODE.upper() == "LIQUIDATE":
@@ -805,10 +804,14 @@ def auto_loop():
                                 pass
                         summary = panic_liquidate_all(client, AUTO_SYMBOLS, bals, _flt_map)
                         app.logger.warning("[PANIC] liquidate summary=%s", summary)
+                        
             except Exception as e:
                 _auto["err"] = f"panic-check: {e}"
+                try:
+                    app.logger.warning("[AUTO] panic-check error: %s", e)
+                except Exception:
+                    pass
                 # swallow to keep main loop alive
-
                 # If panic armed, skip all new BUYs; allow SELLs via TP/SL or trailing
                 # (Your legacy SELL signals below will still be allowed.)
                 # 2) Trailing stop (if active)
