@@ -785,29 +785,29 @@ def auto_loop():
 
                     step_str, min_qty_str, min_notional = flt[sym]
 
-                                    # -------------------- NEW: PANIC + Trailing/TP/SL --------------------
-                # 1) panic kill-switch (arm once, then act)
-                # Build lightweight RSI map once outside the symbol loop if you prefer,
-                # but it's fine here since we already computed rsi_now for each symbol.
-                # We'll pass only BTC/ETH.
+                          # -------------------- NEW: PANIC + Trailing/TP/SL --------------------
                 try:
-                    # Collect latest RSIs (reuse rsi_now if BTC/ETH)
                     rsi_map = {}
                     if sym == "BTCUSDT":
                         rsi_map["BTCUSDT"] = rsi_now
                     if sym == "ETHUSDT":
                         rsi_map["ETHUSDT"] = rsi_now
 
-                    # Try to arm (harmless if already armed)
                     if panic_check_and_maybe_trigger(rsi_map):
-                        # Stop the loop from placing new BUYs
-                        _auto["enabled"] = False
-                        # Optional hedge: sell everything immediately if PANIC_MODE=LIQUIDATE
+                        _auto["enabled"] = False  # block new BUYs
                         if PANIC_MODE.upper() == "LIQUIDATE":
-                            summary = panic_liquidate_all(client, AUTO_SYMBOLS, bals, flt)
+                            # build filters map once for all symbols
+                            _flt_map = {}
+                            for s in AUTO_SYMBOLS:
+                                try:
+                                    _flt_map[s] = symbol_filters(client, s)
+                                except Exception:
+                                    pass
+                            summary = panic_liquidate_all(client, AUTO_SYMBOLS, bals, _flt_map)
                             app.logger.warning("[PANIC] liquidate summary=%s", summary)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _auto["err"] = f"panic-check: {e}"
+                    # swallow to keep main loop alive
 
                 # If panic armed, skip all new BUYs; allow SELLs via TP/SL or trailing
                 # (Your legacy SELL signals below will still be allowed.)
