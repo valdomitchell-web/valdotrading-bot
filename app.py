@@ -388,7 +388,6 @@ SELL_RSI_MIN       = float(os.getenv("SELL_RSI_MIN", "45"))      # was 40
 PER_SYMBOL_MAX_USDT = float(os.getenv("PER_SYMBOL_MAX_USDT", "25"))   # cap per-symbol notional before allowing new buys
 AUTO_MAX_BUYS_PER_MIN = int(os.getenv("AUTO_MAX_BUYS_PER_MIN", "3"))  # throttle bursts on choppy bars
 
-
 _auto = {
     "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
     "last_trade_ts": {},
@@ -630,7 +629,6 @@ def panic_liquidate_all(client, symbols, bals, flt_map):
             summary.append({"symbol": sym, "error": str(e)})
     return summary
 
-
 # --- indicators ---
 def ema(series, n):
     k = 2/(n+1)
@@ -730,7 +728,7 @@ def auto_loop():
                 flt[s] = symbol_filters(client, s)
             except Exception:
                 bad.append(s)
-
+                
         valid_symbols = list(flt.keys())
         if bad:
             _auto["err"] = f"skipping invalid symbols: {','.join(bad)}"
@@ -836,7 +834,6 @@ def auto_loop():
                         except Exception:
                             pass
                 # -------------------- END NEW BLOCK --------------------
-
                    # --- churn guards ---
                     sep_bps = ema_sep_bps(p2, q2)
                     buy_ok  = bull_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "BUY")  and (sep_bps >= EMA_SEP_BPS)
@@ -853,7 +850,6 @@ def auto_loop():
                     if not isinstance(mb, dict) or mb.get("when") != now_min:
                         _auto["minute_buys"] = {"when": now_min, "count": 0}
                     can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
-
 
                     # -------------------- BUY (use quoteOrderQty) --------------------
                     if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
@@ -962,8 +958,7 @@ def auto_loop():
             _auto["stop"].wait(30)
 
         app.logger.info("[AUTO] stopped")
-
-
+        
 # --- robust route (re)registration helpers (no decorators) ---
 def _replace_route(rule: str, endpoint: str):
     """Remove any existing rule OR endpoint so we can safely re-register."""
@@ -1228,7 +1223,6 @@ _register("/auto/step",      "auto_step",      ["GET"],  _auto_step_view)
 _register("/debug/live_buy", "debug_live_buy", ["POST"], _debug_live_buy_view)
 
 # ============== END of auto trader (decoratorless) ==============
-
 @app.get("/balances_live")
 def balances_live():
     # allow if logged in OR header token
@@ -1415,8 +1409,7 @@ def positions_reconcile():
     except Exception as e:
         db.session.rollback()
         return jsonify(ok=False, error=str(e)), 500
-
-
+        
 # ============== Risk / guardrails ==============
 _last_signal_at: dict[str, float] = {}  # symbol -> epoch seconds
 
