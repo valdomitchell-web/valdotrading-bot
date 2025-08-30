@@ -1085,11 +1085,12 @@ def _panic_clear_view():
     return jsonify(ok=True, armed=False)
 
 # Bind routes
-_register("/trail/enable",  "trail_enable",  ["POST"], _trail_enable_view)
-_register("/trail/disable", "trail_disable", ["POST"], _trail_disable_view)
-_register("/trail/status",  "trail_status",  ["GET"],  _trail_status_view)
-_register("/panic/hedge",   "panic_hedge",   ["POST"], _panic_hedge_view)
-_register("/panic/clear",   "panic_clear",   ["POST"], _panic_clear_view)
+_register("/trail/enable",  "trail_enable_v2",  ["POST"], _trail_enable_view)
+_register("/trail/disable", "trail_disable_v2", ["POST"], _trail_disable_view)
+_register("/trail/status",  "trail_status_v2",  ["GET"],  _trail_status_view)
+
+_register("/panic/hedge",   "panic_hedge_v2",   ["POST"], _panic_hedge_view)
+_register("/panic/clear",   "panic_clear_v2",   ["POST"], _panic_clear_view)
 
 def _auto_step_view():
     if not require_admin():
@@ -1208,12 +1209,12 @@ def _debug_live_buy_view():
         return jsonify(ok=False, error=str(e)), 500
 
 # --- bind (and replace if already bound) ---
-_register("/auto/status",    "auto_status",    ["GET"],  _auto_status_view)
-_register("/auto/start",     "auto_start",     ["POST"], _auto_start_view)
-_register("/auto/stop",      "auto_stop",      ["POST"], _auto_stop_view)
-_register("/auto/decisions", "auto_decisions", ["GET"],  _auto_decisions_view)
-_register("/auto/step",      "auto_step",      ["GET"],  _auto_step_view)
-_register("/debug/live_buy", "debug_live_buy", ["POST"], _debug_live_buy_view)
+_register("/auto/status",    "auto_status_v2",    ["GET"],  _auto_status_view)
+_register("/auto/start",     "auto_start_v2",     ["POST"], _auto_start_view)
+_register("/auto/stop",      "auto_stop_v2",      ["POST"], _auto_stop_view)
+_register("/auto/decisions", "auto_decisions_v2", ["GET"],  _auto_decisions_view)
+_register("/auto/step",      "auto_step_v2",      ["GET"],  _auto_step_view)
+_register("/debug/live_buy", "debug_live_buy_v2", ["POST"], _debug_live_buy_view)
 
 # ============== END of auto trader (decoratorless) ==============
 @app.get("/balances_live")
