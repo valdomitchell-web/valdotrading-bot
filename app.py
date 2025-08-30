@@ -363,6 +363,20 @@ SELL_RSI_MIN = float(os.getenv("SELL_RSI_MIN", "40"))
 ALLOW_TREND_ENTRY = env_true("ALLOW_TREND_ENTRY", "false")
 ALLOW_TREND_EXIT  = env_true("ALLOW_TREND_EXIT",  "false")
 
+# --- profit protection & safety knobs ---
+ENABLE_TPSL      = env_true("ENABLE_TPSL", "true")       # enable static TP/SL bands
+TP_PCT           = float(os.getenv("TP_PCT", "0.0125"))  # 1.25% take-profit
+SL_PCT           = float(os.getenv("SL_PCT", "0.008"))   # 0.8% stop-loss
+
+ENABLE_TRAILING  = env_true("ENABLE_TRAILING", "true")   # enable trailing exits
+TRAIL_ARM_PCT    = float(os.getenv("TRAIL_ARM_PCT", "0.005"))  # arm when +0.5% over avg
+TRAIL_PCT        = float(os.getenv("TRAIL_PCT", "0.01"))       # 1% trail from peak once armed
+
+# Panic hedge kill-switch
+PANIC_MODE       = os.getenv("PANIC_MODE", "STOP")       # STOP or LIQUIDATE
+PANIC_RSI_BTC    = float(os.getenv("PANIC_RSI_BTC", "23"))  # if BTC RSI < this => panic
+PANIC_RSI_ETH    = float(os.getenv("PANIC_RSI_ETH", "20"))
+
 CROSS_CONFIRM_BARS = int(os.getenv("CROSS_CONFIRM_BARS", "2"))   # require ef>es (or ef<es) for N closed bars
 EMA_SEP_BPS        = float(os.getenv("EMA_SEP_BPS", "8"))        # min EMA separation to act, in basis points (8 = 0.08%)
 
@@ -375,9 +389,12 @@ PER_SYMBOL_MAX_USDT = float(os.getenv("PER_SYMBOL_MAX_USDT", "25"))   # cap per-
 AUTO_MAX_BUYS_PER_MIN = int(os.getenv("AUTO_MAX_BUYS_PER_MIN", "3"))  # throttle bursts on choppy bars
 
 
-# --- state & logs ---
-_auto = {"thread": None, "stop": Event(), "enabled": False, "last": None, "err": None, "last_trade_ts": {}}
-DECISIONS = deque(maxlen=200)
+_auto = {
+    "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
+    "last_trade_ts": {},
+    "trails": {},                  # per-symbol trailing state
+    "panic_armed": False,          # kill-switch latch
+}
 
 # --- client ---
 def make_client():
@@ -426,6 +443,193 @@ def symbol_filters(client, symbol):
                 except Exception:
                     pass
     return step_str, min_qty_str, min_notional
+
+# --- position helpers (avg price from DB if available) ---
+def get_open_long_avg_price(symbol: str):
+    try:
+        # Position model assumed present in your app (used by dashboard)
+        pos = Position.query.filter_by(symbol=symbol, side="LONG", is_open=True)\
+                            .order_by(Position.id.desc()).first()
+        return float(pos.avg_price) if pos else None
+    except Exception:
+        return None
+
+# --- trailing manager ---
+def ensure_trail_state(symbol: str, avg_price: float):
+    st = _auto["trails"].get(symbol)
+    if not st:
+        st = {
+            "active": ENABLE_TRAILING,
+            "armed": False,
+            "arm_pct": TRAIL_ARM_PCT,
+            "trail_pct": TRAIL_PCT,
+            "arm_price": (avg_price * (1.0 + TRAIL_ARM_PCT)) if avg_price else None,
+            "peak": None,
+        }
+        _auto["trails"][symbol] = st
+    return st
+
+def eval_trailing_and_maybe_sell(client, symbol: str, price: float, base_bal: float, flt):
+    """
+    Returns True if it executed a SELL due to trailing; False otherwise.
+    """
+    try:
+        if not ENABLE_TRAILING:
+            return False
+        avg = get_open_long_avg_price(symbol)
+        if not avg:
+            return False
+
+        st = ensure_trail_state(symbol, avg)
+        if not st["active"]:
+            return False
+
+        step_str, min_qty_str, min_notional = flt
+        notional = base_bal * price
+        if notional < min_notional:
+            return False
+
+        # Arm if not armed and price crosses arm threshold
+        if (not st["armed"]) and st["arm_price"] and price >= st["arm_price"]:
+            st["armed"] = True
+            st["peak"] = price
+
+        # Track peak
+        if st["armed"]:
+            st["peak"] = max(st["peak"] or price, price)
+            trigger = (st["peak"] * (1.0 - st["trail_pct"]))
+            if price <= trigger:
+                qty_str = qty_to_str(base_bal, step_str, min_qty_str)
+                if float(qty_str) * price >= min_notional and float(qty_str) > 0:
+                    o = client.create_order(
+                        symbol=symbol, side="SELL",
+                        type=Client.ORDER_TYPE_MARKET, quantity=qty_str, recvWindow=10000
+                    )
+                    # record locally
+                    fills = o.get("fills") or []
+                    filled_qty = sum(float(f["qty"]) for f in fills) if fills else float(o.get("executedQty") or 0.0)
+                    avg_price = (sum(float(f["price"]) * float(f["qty"]) for f in fills) /
+                                 max(filled_qty, 1e-12)) if fills else price
+                    try:
+                        db.session.add(Trade(symbol=symbol, side="SELL", amount=float(filled_qty),
+                                             price=float(avg_price), timestamp=datetime.utcnow(),
+                                             is_open=False, source="auto"))
+                        db.session.commit()
+                    except Exception:
+                        db.session.rollback()
+                    record_order_row(o, 'SELL', symbol, float(filled_qty), float(avg_price), position_id=None)
+                    close_position_if_filled_sells(symbol)
+                    log_decision(symbol, None, None, None, "SELL", "trail-stop")
+                    return True
+        return False
+    except BinanceAPIException as e:
+        _auto["err"] = str(e)
+        log_decision(symbol, None, None, None, "HOLD", "trail-api-error")
+        return False
+    except Exception as e:
+        _auto["err"] = str(e)
+        return False
+
+# --- static TP/SL bands ---
+def eval_tpsl_and_maybe_sell(client, symbol: str, price: float, base_bal: float, flt):
+    """
+    Returns True if it executed a SELL due to TP/SL; False otherwise.
+    """
+    if not ENABLE_TPSL:
+        return False
+    try:
+        avg = get_open_long_avg_price(symbol)
+        if not avg:
+            return False
+
+        step_str, min_qty_str, min_notional = flt
+        notional = base_bal * price
+        if notional < min_notional:
+            return False
+
+        take = avg * (1.0 + TP_PCT)
+        stop = avg * (1.0 - SL_PCT)
+        reason = None
+        if price >= take:
+            reason = "tp"
+        elif price <= stop:
+            reason = "sl"
+
+        if reason:
+            qty_str = qty_to_str(base_bal, step_str, min_qty_str)
+            if float(qty_str) * price >= min_notional and float(qty_str) > 0:
+                o = client.create_order(
+                    symbol=symbol, side="SELL",
+                    type=Client.ORDER_TYPE_MARKET, quantity=qty_str, recvWindow=10000
+                )
+                fills = o.get("fills") or []
+                filled_qty = sum(float(f["qty"]) for f in fills) if fills else float(o.get("executedQty") or 0.0)
+                avg_price = (sum(float(f["price"]) * float(f["qty"]) for f in fills) /
+                             max(filled_qty, 1e-12)) if fills else price
+                try:
+                    db.session.add(Trade(symbol=symbol, side="SELL", amount=float(filled_qty),
+                                         price=float(avg_price), timestamp=datetime.utcnow(),
+                                         is_open=False, source="auto"))
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+                record_order_row(o, 'SELL', symbol, float(filled_qty), float(avg_price), position_id=None)
+                close_position_if_filled_sells(symbol)
+                log_decision(symbol, None, None, None, "SELL", reason)
+                return True
+        return False
+    except BinanceAPIException as e:
+        _auto["err"] = str(e)
+        log_decision(symbol, None, None, None, "HOLD", "tpsl-api-error")
+        return False
+    except Exception as e:
+        _auto["err"] = str(e)
+        return False
+
+# --- panic hedge (STOP/LIQUIDATE) ---
+def panic_check_and_maybe_trigger(rsi_map):
+    """
+    rsi_map: {"BTCUSDT": rsi_value, "ETHUSDT": rsi_value}
+    Arms the global kill-switch if thresholds breached.
+    """
+    try:
+        if _auto["panic_armed"]:
+            return True
+        btc_rsi = rsi_map.get("BTCUSDT")
+        eth_rsi = rsi_map.get("ETHUSDT")
+        if (btc_rsi is not None and btc_rsi < PANIC_RSI_BTC) or (eth_rsi is not None and eth_rsi < PANIC_RSI_ETH):
+            _auto["panic_armed"] = True
+            return True
+        return False
+    except Exception:
+        return False
+
+def panic_liquidate_all(client, symbols, bals, flt_map):
+    """
+    Sells all base balances for given symbols (step-safe).
+    """
+    summary = []
+    for sym in symbols:
+        try:
+            base = sym.replace("USDT", "")
+            price = float(client.get_symbol_ticker(symbol=sym)["price"])
+            base_bal = bals.get(base, 0.0)
+            if base_bal <= 0:
+                continue
+            step_str, min_qty_str, min_notional = flt_map.get(sym, ("1","0",5.0))
+            if base_bal * price < min_notional:
+                continue
+            qty_str = qty_to_str(base_bal, step_str, min_qty_str)
+            if float(qty_str) * price < min_notional or float(qty_str) <= 0:
+                continue
+            o = client.create_order(symbol=sym, side="SELL", type=Client.ORDER_TYPE_MARKET,
+                                    quantity=qty_str, recvWindow=10000)
+            summary.append({"symbol": sym, "qty": qty_str, "status": o.get("status")})
+            log_decision(sym, None, None, None, "SELL", "panic-hedge")
+        except Exception as e:
+            summary.append({"symbol": sym, "error": str(e)})
+    return summary
+
 
 # --- indicators ---
 def ema(series, n):
@@ -582,6 +786,56 @@ def auto_loop():
                     base_bal = bals.get(base, 0.0)
 
                     step_str, min_qty_str, min_notional = flt[sym]
+
+                                    # -------------------- NEW: PANIC + Trailing/TP/SL --------------------
+                # 1) panic kill-switch (arm once, then act)
+                # Build lightweight RSI map once outside the symbol loop if you prefer,
+                # but it's fine here since we already computed rsi_now for each symbol.
+                # We'll pass only BTC/ETH.
+                try:
+                    # Collect latest RSIs (reuse rsi_now if BTC/ETH)
+                    rsi_map = {}
+                    if sym == "BTCUSDT":
+                        rsi_map["BTCUSDT"] = rsi_now
+                    if sym == "ETHUSDT":
+                        rsi_map["ETHUSDT"] = rsi_now
+
+                    # Try to arm (harmless if already armed)
+                    if panic_check_and_maybe_trigger(rsi_map):
+                        # Stop the loop from placing new BUYs
+                        _auto["enabled"] = False
+                        # Optional hedge: sell everything immediately if PANIC_MODE=LIQUIDATE
+                        if PANIC_MODE.upper() == "LIQUIDATE":
+                            summary = panic_liquidate_all(client, AUTO_SYMBOLS, bals, flt)
+                            app.logger.warning("[PANIC] liquidate summary=%s", summary)
+                except Exception:
+                    pass
+
+                # If panic armed, skip all new BUYs; allow SELLs via TP/SL or trailing
+                # (Your legacy SELL signals below will still be allowed.)
+                # 2) Trailing stop (if active)
+                if f and base_bal > 0:
+                    sold = eval_trailing_and_maybe_sell(client, sym, price, base_bal, f)
+                    if sold:
+                        # Recompute balances after sell to avoid double actions
+                        try:
+                            acct = client.get_account()
+                            bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                            base_bal = bals.get(base, 0.0)
+                        except Exception:
+                            pass
+
+                # 3) Static TP/SL
+                if f and base_bal > 0:
+                    sold = eval_tpsl_and_maybe_sell(client, sym, price, base_bal, f)
+                    if sold:
+                        try:
+                            acct = client.get_account()
+                            bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                            base_bal = bals.get(base, 0.0)
+                        except Exception:
+                            pass
+                # -------------------- END NEW BLOCK --------------------
 
                    # --- churn guards ---
                     sep_bps = ema_sep_bps(p2, q2)
@@ -775,6 +1029,79 @@ def _auto_decisions_view():
             (ADMIN_TOKEN and request.headers.get("X-Admin-Token") == ADMIN_TOKEN)):
         return jsonify(ok=False, error="auth"), 401
     return jsonify(ok=True, items=list(DECISIONS))
+
+# --- trailing control routes ---
+def _trail_enable_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    data = request.get_json(silent=True) or {}
+    sym = (data.get("symbol") or "").upper()
+    arm = float(data.get("arm_pct") or TRAIL_ARM_PCT)
+    trail = float(data.get("trail_pct") or TRAIL_PCT)
+    if not sym:
+        return jsonify(ok=False, error="symbol required"), 400
+    avg = get_open_long_avg_price(sym)
+    st = ensure_trail_state(sym, avg or 0.0)
+    st.update({"active": True, "armed": False, "arm_pct": arm, "trail_pct": trail,
+               "arm_price": (avg * (1.0 + arm)) if avg else None, "peak": None})
+    return jsonify(ok=True, symbol=sym, state=st)
+
+def _trail_disable_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    data = request.get_json(silent=True) or {}
+    sym = (data.get("symbol") or "").upper()
+    if not sym:
+        return jsonify(ok=False, error="symbol required"), 400
+    st = _auto["trails"].get(sym) or {}
+    st["active"] = False
+    st["armed"] = False
+    _auto["trails"][sym] = st
+    return jsonify(ok=True, symbol=sym, state=st)
+
+def _trail_status_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    return jsonify(ok=True, trails=_auto["trails"])
+
+# --- panic control routes ---
+def _panic_hedge_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    client = make_client()
+    try:
+        acct = client.get_account()
+        bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+    except Exception as e:
+        return jsonify(ok=False, error=f"account: {e}"), 500
+
+    # ensure filters map
+    flt_map = {}
+    for s in AUTO_SYMBOLS:
+        try:
+            flt_map[s] = symbol_filters(client, s)
+        except Exception:
+            pass
+
+    _auto["panic_armed"] = True
+    _auto["enabled"] = False
+    summary = []
+    if PANIC_MODE.upper() == "LIQUIDATE":
+        summary = panic_liquidate_all(client, AUTO_SYMBOLS, bals, flt_map)
+    return jsonify(ok=True, mode=PANIC_MODE, summary=summary)
+
+def _panic_clear_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    _auto["panic_armed"] = False
+    return jsonify(ok=True, armed=False)
+
+# Bind routes
+_register("/trail/enable",  "trail_enable",  ["POST"], _trail_enable_view)
+_register("/trail/disable", "trail_disable", ["POST"], _trail_disable_view)
+_register("/trail/status",  "trail_status",  ["GET"],  _trail_status_view)
+_register("/panic/hedge",   "panic_hedge",   ["POST"], _panic_hedge_view)
+_register("/panic/clear",   "panic_clear",   ["POST"], _panic_clear_view)
 
 def _auto_step_view():
     if not require_admin():
