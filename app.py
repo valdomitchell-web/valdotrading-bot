@@ -786,28 +786,28 @@ def auto_loop():
                     step_str, min_qty_str, min_notional = flt[sym]
 
                           # -------------------- NEW: PANIC + Trailing/TP/SL --------------------
-                try:
-                    rsi_map = {}
-                    if sym == "BTCUSDT":
-                        rsi_map["BTCUSDT"] = rsi_now
-                    if sym == "ETHUSDT":
-                        rsi_map["ETHUSDT"] = rsi_now
+            try:
+                rsi_map = {}
+                if sym == "BTCUSDT":
+                    rsi_map["BTCUSDT"] = rsi_now
+                if sym == "ETHUSDT":
+                    rsi_map["ETHUSDT"] = rsi_now
 
-                    if panic_check_and_maybe_trigger(rsi_map):
-                        _auto["enabled"] = False  # block new BUYs
-                        if PANIC_MODE.upper() == "LIQUIDATE":
-                            # build filters map once for all symbols
-                            _flt_map = {}
-                            for s in AUTO_SYMBOLS:
-                                try:
-                                    _flt_map[s] = symbol_filters(client, s)
-                                except Exception:
-                                    pass
-                            summary = panic_liquidate_all(client, AUTO_SYMBOLS, bals, _flt_map)
-                            app.logger.warning("[PANIC] liquidate summary=%s", summary)
-                except Exception as e:
-                    _auto["err"] = f"panic-check: {e}"
-                    # swallow to keep main loop alive
+                if panic_check_and_maybe_trigger(rsi_map):
+                    _auto["enabled"] = False  # block new BUYs
+                    if PANIC_MODE.upper() == "LIQUIDATE":
+                        # build filters map once for all symbols
+                        _flt_map = {}
+                        for s in AUTO_SYMBOLS:
+                            try:
+                                _flt_map[s] = symbol_filters(client, s)
+                            except Exception:
+                                pass
+                        summary = panic_liquidate_all(client, AUTO_SYMBOLS, bals, _flt_map)
+                        app.logger.warning("[PANIC] liquidate summary=%s", summary)
+            except Exception as e:
+                _auto["err"] = f"panic-check: {e}"
+                # swallow to keep main loop alive
 
                 # If panic armed, skip all new BUYs; allow SELLs via TP/SL or trailing
                 # (Your legacy SELL signals below will still be allowed.)
