@@ -593,12 +593,13 @@ def auto_loop():
                     symbol_notional = base_bal * price
                     under_cap = (symbol_notional < PER_SYMBOL_MAX_USDT)
 
-                    # simple burst throttle: no more than N buys per minute across all symbols
+                   # --- burst throttle (per-minute) ---
                     now_min = int(time.time() // 60)
-                    _auto.setdefault("minute_buys", {})
-                    if _auto["minute_buys"].get("when") != now_min:
-                    _auto["minute_buys"] = {"when": now_min, "count": 0}
+                    mb = _auto.get("minute_buys")
+                    if not isinstance(mb, dict) or mb.get("when") != now_min:
+                        _auto["minute_buys"] = {"when": now_min, "count": 0}
                     can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
+
 
                     # -------------------- BUY (use quoteOrderQty) --------------------
                     if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
@@ -825,11 +826,11 @@ def _auto_step_view():
             symbol_notional = base_bal * price
             under_cap = (symbol_notional < PER_SYMBOL_MAX_USDT)
 
-            # simple burst throttle: no more than N buys per minute across all symbols
+            # --- burst throttle (per-minute) ---
             now_min = int(time.time() // 60)
-            _auto.setdefault("minute_buys", {})
-            if _auto["minute_buys"].get("when") != now_min:
-            _auto["minute_buys"] = {"when": now_min, "count": 0}
+            mb = _auto.get("minute_buys")
+            if not isinstance(mb, dict) or mb.get("when") != now_min:
+                _auto["minute_buys"] = {"when": now_min, "count": 0}
             can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
     
            if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
