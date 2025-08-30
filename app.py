@@ -813,8 +813,6 @@ def _auto_step_view():
             base = sym.replace("USDT", "")
             base_bal = bals.get(base, 0.0)
             _, _, min_notional = symbol_filters(client, sym)
-            action = "HOLD"
-            reason = "no-cross"
            
             # --- churn guards ---
             sep_bps = ema_sep_bps(p2, q2)
@@ -832,7 +830,9 @@ def _auto_step_view():
             if not isinstance(mb, dict) or mb.get("when") != now_min:
                 _auto["minute_buys"] = {"when": now_min, "count": 0}
             can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
-    
+
+            action = "HOLD"
+            reason = "no-cross"
            if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
                _auto["minute_buys"]["count"] += 1 
                action, reason = "BUY", "signal"
