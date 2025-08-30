@@ -604,7 +604,6 @@ def auto_loop():
                     # -------------------- BUY (use quoteOrderQty) --------------------
                     if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
                         spend = max(AUTO_RISK_USDT, min_notional)  # satisfy exchange min notional
-                        _auto["minute_buys"]["count"] += 1
                         try:
                             o = client.create_order(
                                 symbol=sym,
@@ -634,9 +633,11 @@ def auto_loop():
                             # record order locally for the dashboard
                             record_order_row(o, 'BUY', sym, float(filled_qty), float(avg_price),
                                              position_id=(pos.id if pos else None))
-
+                            
+                            _auto["minute_buys"]["count"] += 1
                             app.logger.info("[AUTO] BUY %s qty=%.8f @ %.4f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
                             log_decision(sym, p2, q2, rsi_now, "BUY", "signal")
+                            
                         except BinanceAPIException as e:
                             _auto["err"] = str(e)
                             app.logger.warning("[AUTO] %s BUY error: %s", sym, e)
@@ -833,14 +834,14 @@ def _auto_step_view():
 
             action = "HOLD"
             reason = "no-cross"
-           if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
-               _auto["minute_buys"]["count"] += 1 
+            if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
                action, reason = "BUY", "signal"
             elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                 action, reason = "SELL", "signal"
             elif base_bal * price >= min_notional:
                 reason = "have-base"
-
+            _auto["minute_buys"]["count"] += 1 
+            
             items.append({
                 "symbol": sym,
                 "ef": round(p2, 6), "es": round(q2, 6),
