@@ -1149,7 +1149,7 @@ def _auto_step_view():
 
             action = "HOLD"
             reason = "no-cross"
-                        if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
+            if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
                 action, reason = "BUY", "signal"
             elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                 action, reason = "SELL", "signal"
