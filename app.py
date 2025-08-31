@@ -411,14 +411,33 @@ _PER_SYM_COOLDOWN_RAW = os.getenv("PER_SYMBOL_COOLDOWN", "").strip()  # e.g. "BT
 # Optional: override kline limit (0 => auto compute from indicators)
 KL_LIMIT = int(os.getenv("KL_LIMIT", "0"))
 
+# --- volatility / risk knobs ---
+ATR_LEN          = int(os.getenv("ATR_LEN", "14"))
+ATR_MIN_PCT      = float(os.getenv("ATR_MIN_PCT", "0.15"))  # ignore signals when too quiet
+ATR_MAX_PCT      = float(os.getenv("ATR_MAX_PCT", "2.5"))   # and when too wild
+KL_LIMIT         = int(os.getenv("KL_LIMIT", "120"))        # kline limit per fetch
+
+# --- adaptive sizing (ATR-based) ---
+DYN_RISK             = (str(os.getenv("DYN_RISK", "true")).lower() in ("1","true","yes","y","on"))
+DYN_RISK_MULT        = float(os.getenv("DYN_RISK_MULT", "1.0"))  # scales ATR% against baseline
+DYN_RISK_MIN_USDT    = float(os.getenv("DYN_RISK_MIN_USDT", "10"))
+DYN_RISK_MAX_USDT    = float(os.getenv("DYN_RISK_MAX_USDT", "50"))
+
+# --- rate limiting / loop pacing ---
+ACCOUNT_REFRESH_N = int(os.getenv("ACCOUNT_REFRESH_N", "2"))  # refresh balances every N ticks
+BACKOFF_1003_SEC  = int(os.getenv("BACKOFF_1003_SEC", "65"))  # cooldown when -1003 seen
+AUTO_POLL_SEC     = int(os.getenv("AUTO_POLL_SEC", "30"))
+
+# --- decisions cap (ring buffer) ---
+DECISIONS_MAX = int(os.getenv("DECISIONS_MAX", "500"))
+
 _auto = {
     "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
     "last_trade_ts": {},
     "trails": {},
     "panic_armed": False,
-    # new:
-    "loop": 0,
-    "bals": {},     # cached balances
+    "loop": 0,              # <— add
+    "bals": {},             # <— add
 }
 
 # --- client ---
@@ -684,6 +703,31 @@ def atr_from_klines(klines, n=14):
         atr = ((atr * (n - 1)) + trs[i]) / n
     return atr
 
+def atr_from_klines(klines, n):
+    """Wilder's ATR from Binance klines (H,L,C). Returns float or None."""
+    highs = [float(k[2]) for k in klines]
+    lows  = [float(k[3]) for k in klines]
+    closes= [float(k[4]) for k in klines]
+    if len(closes) < n + 1:
+        return None
+    trs = []
+    prev_close = closes[0]
+    for i in range(1, len(closes)):
+        h, l = highs[i], lows[i]
+        tr = max(h - l, abs(h - prev_close), abs(prev_close - l))
+        trs.append(tr)
+        prev_close = closes[i]
+    if len(trs) < n:
+        return None
+    atr = sum(trs[:n]) / n
+    for tr in trs[n:]:
+        atr = ((n - 1) * atr + tr) / n
+    return atr
+
+def is_rate_limit_err(e: Exception) -> bool:
+    s = str(e)
+    return ("-1003" in s) or ("Too much request weight" in s)
+
 # --- indicators ---
 def ema(series, n):
     k = 2/(n+1)
@@ -764,6 +808,20 @@ def log_decision(sym, ema_fast_v, ema_slow_v, rsi_now, action, reason):
         "action": action,
         "reason": reason,
     })
+    # ring buffer trim
+    try:
+        max_len = int(DECISIONS_MAX)
+    except Exception:
+        max_len = 500
+    if len(DECISIONS) > max_len:
+        del DECISIONS[:len(DECISIONS) - max_len]
+
+    try:
+        app.logger.info("[AUTO] %s | ef=%.6f es=%.6f rsi=%.2f -> %s (%s)",
+                        sym, float(ema_fast_v or 0), float(ema_slow_v or 0), float(rsi_now or 0), action, reason)
+    except Exception:
+        pass
+        
         # cap the buffer
     if len(DECISIONS) > 500:
         del DECISIONS[:-500]
@@ -995,7 +1053,14 @@ def auto_loop():
                     and under_cap
                     and can_add_buy
                 ):
-                    spend = max(AUTO_RISK_USDT, min_notional)  # satisfy exchange min notional
+                    spend = max(AUTO_RISK_USDT, min_notional)  # base spend
+                    if DYN_RISK and (atr_pct is not None):
+                        # ATR% -> dynamic spend around baseline AUTO_RISK_USDT
+                        dyn = (atr_pct / 100.0) * DYN_RISK_MULT * AUTO_RISK_USDT
+                        spend = min(
+                            max(dyn, max(DYN_RISK_MIN_USDT, min_notional)),
+                            DYN_RISK_MAX_USDT
+                        )
                     try:
                         o = client.create_order(
                             symbol=sym,
@@ -1150,7 +1215,14 @@ def _as_config_dict():
         AUTO_SYMBOLS=AUTO_SYMBOLS,
         PANIC_ARMED=_auto.get("panic_armed", False),
         AUTO_ENABLED=_auto.get("enabled", False),
+        # NEW
+        ATR_LEN=ATR_LEN, ATR_MIN_PCT=ATR_MIN_PCT, ATR_MAX_PCT=ATR_MAX_PCT, KL_LIMIT=KL_LIMIT,
+        DYN_RISK=DYN_RISK, DYN_RISK_MULT=DYN_RISK_MULT,
+        DYN_RISK_MIN_USDT=DYN_RISK_MIN_USDT, DYN_RISK_MAX_USDT=DYN_RISK_MAX_USDT,
+        ACCOUNT_REFRESH_N=ACCOUNT_REFRESH_N, BACKOFF_1003_SEC=BACKOFF_1003_SEC,
+        AUTO_POLL_SEC=AUTO_POLL_SEC, DECISIONS_MAX=DECISIONS_MAX,
     )
+
 
 def _auto_config_view():
     if not require_admin():
@@ -1162,10 +1234,17 @@ def _auto_config_view():
     data = request.get_json(silent=True) or {}
 
     # Allowed keys and coercions
-    bool_keys  = ["ENABLE_TPSL","ENABLE_TRAILING","ALLOW_TREND_ENTRY","ALLOW_TREND_EXIT"]
-    float_keys = ["TP_PCT","SL_PCT","TRAIL_ARM_PCT","TRAIL_PCT","PANIC_RSI_BTC","PANIC_RSI_ETH",
-                  "BUY_RSI_MAX","SELL_RSI_MIN","EMA_SEP_BPS","AUTO_RISK_USDT","PER_SYMBOL_MAX_USDT"]
-    int_keys   = ["EMA_FAST","EMA_SLOW","RSI_LEN","AUTO_COOLDOWN_SEC","AUTO_MAX_BUYS_PER_MIN","CROSS_CONFIRM_BARS"]
+    bool_keys  = ["ENABLE_TPSL","ENABLE_TRAILING","ALLOW_TREND_ENTRY","ALLOW_TREND_EXIT","DYN_RISK"]
+    float_keys = [
+        "TP_PCT","SL_PCT","TRAIL_ARM_PCT","TRAIL_PCT","PANIC_RSI_BTC","PANIC_RSI_ETH",
+        "BUY_RSI_MAX","SELL_RSI_MIN","EMA_SEP_BPS","AUTO_RISK_USDT","PER_SYMBOL_MAX_USDT",
+        "ATR_MIN_PCT","ATR_MAX_PCT","DYN_RISK_MULT","DYN_RISK_MIN_USDT","DYN_RISK_MAX_USDT"
+    ]
+    int_keys   = [
+        "EMA_FAST","EMA_SLOW","RSI_LEN","AUTO_COOLDOWN_SEC","AUTO_MAX_BUYS_PER_MIN",
+        "CROSS_CONFIRM_BARS","ATR_LEN","KL_LIMIT","ACCOUNT_REFRESH_N","BACKOFF_1003_SEC",
+        "AUTO_POLL_SEC","DECISIONS_MAX"
+    ]
     str_keys   = ["PANIC_MODE","AUTO_INTERVAL"]
 
     updated = {}
@@ -1284,6 +1363,21 @@ def _auto_decisions_clear_view():
         return jsonify(ok=False, error=str(e)), 500
 
 _register("/auto/decisions/clear", "auto_decisions_clear", ["POST"], _auto_decisions_clear_view)
+
+    def _auto_health_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    return jsonify(
+        ok=True,
+        running=bool(_auto["thread"] and _auto["thread"].is_alive()),
+        enabled=_auto["enabled"],
+        panic=_auto.get("panic_armed", False),
+        last=_auto["last"],
+        loop=_auto.get("loop", 0),
+        err=_auto["err"],
+    )
+
+_register("/auto/health", "auto_health_v2", ["GET"], _auto_health_view)
 
 # --- trailing control routes ---
 def _trail_enable_view():
