@@ -363,6 +363,10 @@ EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
 RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
 
+ATR_LEN      = int(os.getenv("ATR_LEN", "14"))
+ATR_MIN_PCT  = float(os.getenv("ATR_MIN_PCT", "0.25"))  # 0.25% min daily-ish volatility
+ATR_MAX_PCT  = float(os.getenv("ATR_MAX_PCT", "5.0"))   # 5% cap to avoid chaos
+
 BUY_RSI_MAX  = float(os.getenv("BUY_RSI_MAX", "60"))
 SELL_RSI_MIN = float(os.getenv("SELL_RSI_MIN", "40"))
 
@@ -643,6 +647,35 @@ def panic_liquidate_all(client, symbols, bals, flt_map):
             summary.append({"symbol": sym, "error": str(e)})
     return summary
 
+def atr_from_klines(klines, n=14):
+    """
+    Wilder ATR using klines. Returns the latest ATR (float) or None if not enough bars.
+    """
+    if not klines or len(klines) < n + 2:
+        return None
+
+    highs  = [float(k[2]) for k in klines]
+    lows   = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+
+    trs = []
+    for i in range(len(klines)):
+        if i == 0:
+            tr = highs[i] - lows[i]
+        else:
+            tr = max(highs[i] - lows[i],
+                     abs(highs[i] - closes[i-1]),
+                     abs(lows[i]  - closes[i-1]))
+        trs.append(tr)
+
+    # Wilder smoothing
+    if len(trs) < n + 1:
+        return None
+    atr = sum(trs[1:n+1]) / n
+    for i in range(n+1, len(trs)):
+        atr = ((atr * (n - 1)) + trs[i]) / n
+    return atr
+
 # --- indicators ---
 def ema(series, n):
     k = 2/(n+1)
@@ -837,6 +870,21 @@ def auto_loop():
                 price = float(closes[-1])  # reuse last close; saves a request per symbol
                 base = sym.replace("USDT", "")
                 base_bal = bals.get(base, 0.0)
+
+                price = float(closes[-1])  # reuse last close, avoids extra ticker call
+                base = sym.replace("USDT", "")
+                base_bal = bals.get(base, 0.0)
+
+                # --- volatility guard (ATR %) ---
+                atr_val = atr_from_klines(kl, ATR_LEN)
+                atr_pct = (atr_val / price * 100.0) if (atr_val is not None and price > 0) else None
+                if atr_pct is not None:
+                    if atr_pct < ATR_MIN_PCT:
+                        log_decision(sym, p2, q2, rsi_now, "HOLD", "low-vol")
+                        continue
+                    if atr_pct > ATR_MAX_PCT:
+                        log_decision(sym, p2, q2, rsi_now, "HOLD", "high-vol")
+                        continue
 
                 step_str, min_qty_str, min_notional = flt[sym]
                 f = (step_str, min_qty_str, min_notional)
@@ -1304,10 +1352,15 @@ def _auto_step_view():
             bull_x = bull_cross or (allow_entry and trend_up)
             bear_x = bear_cross or (allow_exit  and trend_dn)
 
-            price = float(client.get_symbol_ticker(symbol=sym)["price"])
+            price = float(closes[-1])  # reuse last close; fewer requests
             base = sym.replace("USDT", "")
             base_bal = bals.get(base, 0.0)
             _, _, min_notional = symbol_filters(client, sym)
+
+            # ATR %
+            atr_val = atr_from_klines(kl, ATR_LEN)
+            atr_pct = (atr_val / price * 100.0) if (atr_val is not None and price > 0) else None
+
            
             # --- churn guards ---
             sep_bps = ema_sep_bps(p2, q2)
@@ -1328,21 +1381,30 @@ def _auto_step_view():
 
             action = "HOLD"
             reason = "no-cross"
-            if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
-                action, reason = "BUY", "signal"
-            elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
-                action, reason = "SELL", "signal"
-            elif base_bal * price >= min_notional:
-                reason = "have-base"
-            # NOTE: /auto/step is read-only; do not mutate minute_buys here.
+
+            # Volatility gate first
+            if atr_pct is not None and atr_pct < ATR_MIN_PCT:
+                reason = "low-vol"
+            elif atr_pct is not None and atr_pct > ATR_MAX_PCT:
+                reason = "high-vol"
+            else:
+                if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
+                    action, reason = "BUY", "signal"
+                    _auto["minute_buys"]["count"] += 1  # increment only if we'd actually BUY
+                elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
+                    action, reason = "SELL", "signal"
+                elif base_bal * price >= min_notional:
+                    reason = "have-base"
    
             items.append({
                 "symbol": sym,
                 "ef": round(p2, 6), "es": round(q2, 6),
                 "rsi": round(rsi_now, 2),
+                "atr_pct": round(atr_pct, 2) if atr_pct is not None else None,
                 "action": action, "reason": reason,
                 "ts": datetime.utcnow().isoformat()
             })
+
         except Exception as e:
             items.append({"symbol": sym, "error": str(e)})
 
