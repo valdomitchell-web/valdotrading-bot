@@ -775,7 +775,7 @@ def auto_loop():
                     log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
                     app.logger.warning("[AUTO] rate-limit (-1003). Backing off %ss", BACKOFF_1003_SEC)
                     _auto["stop"].wait(BACKOFF_1003_SEC)
-                    continue
+                    continue                    
                 else:
                     _auto["err"] = f"account: {e}"
                     app.logger.warning("[AUTO] account error: %s", e)
