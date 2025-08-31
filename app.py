@@ -837,33 +837,33 @@ def auto_loop():
 
             bals = _auto.get("bals", {}) or {}
             need_refresh = (_auto["loop"] % max(ACCOUNT_REFRESH_N, 1)) == 0
-                if need_refresh:
+            if need_refresh:
+                try:
+                    acct = client.get_account()
+                    bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                    _auto["bals"] = bals
+                except BinanceAPIException as e:
+                    msg = str(e)
+                    _auto["err"] = f"account: {msg}"
                     try:
-                        acct = client.get_account()
-                        bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-                        _auto["bals"] = bals
-                    except BinanceAPIException as e:
-                        msg = str(e)
-                        _auto["err"] = f"account: {msg}"
-                        try:
-                            app.logger.warning("[AUTO] account error: %s", msg)
-                        except Exception:
-                            pass
-                        if "-1003" in msg:  # request weight exceeded
-                            proceed = False
-                            sleep_after = max(sleep_after or 0, BACKOFF_1003_SEC)  # e.g. 65
-                            log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
-                        else:
-                             proceed = False
-                             sleep_after = max(sleep_after or 0, 10)
-                     except Exception as e:
-                         _auto["err"] = f"account: {e}"
-                         try:
-                             app.logger.warning("[AUTO] account error: %s", e)
-                         except Exception:
-                             pass
-                         proceed = False
-                         sleep_after = max(sleep_after or 0, 10)
+                        app.logger.warning("[AUTO] account error: %s", msg)
+                    except Exception:
+                        pass
+                    if "-1003" in msg:  # request weight exceeded
+                        proceed = False
+                        sleep_after = max(sleep_after or 0, BACKOFF_1003_SEC)  # e.g. 65
+                        log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
+                    else:
+                        proceed = False
+                        sleep_after = max(sleep_after or 0, 10)
+                except Exception as e:
+                    _auto["err"] = f"account: {e}"
+                    try:
+                        app.logger.warning("[AUTO] account error: %s", e)
+                    except Exception:
+                        pass
+                    proceed = False
+                    sleep_after = max(sleep_after or 0, 10)
 
             if not valid_symbols:
                 log_decision("ALL", None, None, None, "HOLD", "no-valid-symbols")
