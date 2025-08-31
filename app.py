@@ -789,8 +789,8 @@ def auto_loop():
 
             if not valid_symbols:
                 log_decision("ALL", None, None, None, "HOLD", "no-valid-symbols")
-               _auto["loop"] += 1
-               _auto["stop"].wait(max(1, AUTO_POLL_SEC))
+                _auto["loop"] += 1
+                _auto["stop"].wait(max(1, AUTO_POLL_SEC))
                 continue
 
         for sym in valid_symbols:
@@ -988,7 +988,6 @@ def auto_loop():
             except Exception as e:
                 _auto["err"] = str(e)
                 app.logger.exception("[AUTO] %s exception", sym)
-
 
             _auto["stop"].wait(30)
 
