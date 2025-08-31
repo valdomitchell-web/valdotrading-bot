@@ -916,17 +916,17 @@ def auto_loop():
                             except Exception:
                                 db.session.rollback()
 
-                             # attach to most recent open LONG, if it exists
-                             pos = None
-                             try:
-                                 pos = Position.query.filter_by(symbol=sym, side="LONG", is_open=True) \
+                            # attach to most recent open LONG, if it exists
+                            pos = None
+                            try:
+                                pos = Position.query.filter_by(symbol=sym, side="LONG", is_open=True) \
                                                      .order_by(Position.id.desc()).first()
-                             except Exception:
-                                 pos = None
+                            except Exception:
+                                pos = None
 
-                             record_order_row(o, 'SELL', sym, float(filled_qty), float(avg_price),
-                                              position_id=(pos.id if pos else None))
-                             close_position_if_filled_sells(sym)
+                            record_order_row(o, 'SELL', sym, float(filled_qty), float(avg_price),
+                                             position_id=(pos.id if pos else None))
+                            close_position_if_filled_sells(sym)
 
                             app.logger.info("[AUTO] SELL %s qty=%s @ %.4f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
                             log_decision(sym, p2, q2, rsi_now, "SELL", "signal")
