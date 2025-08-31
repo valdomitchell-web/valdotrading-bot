@@ -761,37 +761,54 @@ def auto_loop():
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
 
-        # account balances (cached; only refresh every ACCOUNT_REFRESH_N loops)
-        bals = _auto.get("bals", {}) or {}
-        need_refresh = (_auto["loop"] % max(ACCOUNT_REFRESH_N, 1)) == 0
-        if need_refresh:
-            try:
-                acct = client.get_account()
-                bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-                _auto["bals"] = bals
-            except BinanceAPIException as e:
-                if is_rate_limit_err(e):
-                    _auto["err"] = "rate-limit: -1003"
-                    log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
-                    app.logger.warning("[AUTO] rate-limit (-1003). Backing off %ss", BACKOFF_1003_SEC)
-                    _auto["stop"].wait(BACKOFF_1003_SEC)
-                continue                    
-                else:
+            # --- balances: cached fetch with 1003 backoff, no 'continue' needed ---
+            proceed = True
+            sleep_after = None
+
+            bals = _auto.get("bals", {}) or {}
+            need_refresh = (_auto["loop"] % max(ACCOUNT_REFRESH_N, 1)) == 0
+            if need_refresh:
+                try:
+                    acct = client.get_account()
+                    bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                    _auto["bals"] = bals
+                except BinanceAPIException as e:
+                    if is_rate_limit_err(e):
+                        _auto["err"] = "rate-limit: -1003"
+                        log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
+                        try:
+                            app.logger.warning("[AUTO] rate-limit (-1003). Backing off %ss", BACKOFF_1003_SEC)
+                        except Exception:
+                            pass
+                        proceed = False
+                        sleep_after = BACKOFF_1003_SEC
+                    else:
+                        _auto["err"] = f"account: {e}"
+                        try:
+                            app.logger.warning("[AUTO] account error: %s", e)
+                        except Exception:
+                            pass
+                        proceed = False
+                        sleep_after = 10
+                except Exception as e:
                     _auto["err"] = f"account: {e}"
-                    app.logger.warning("[AUTO] account error: %s", e)
-                    _auto["stop"].wait(10)
-                continue
-            except Exception as e:
-                _auto["err"] = f"account: {e}"
-                app.logger.warning("[AUTO] account error: %s", e)
-                _auto["stop"].wait(10)
-                continue
+                    try:
+                        app.logger.warning("[AUTO] account error: %s", e)
+                    except Exception:
+                        pass
+                    proceed = False
+                    sleep_after = 10
 
             if not valid_symbols:
                 log_decision("ALL", None, None, None, "HOLD", "no-valid-symbols")
+                proceed = False
+                sleep_after = max(sleep_after or 0, 30)
+
+            # bail early this tick (no 'continue' — the rest of the loop is under 'proceed')
+            if not proceed:
                 _auto["loop"] += 1
-                _auto["stop"].wait(max(1, AUTO_POLL_SEC))
-                continue
+                _auto["stop"].wait(max(1, int(sleep_after or AUTO_POLL_SEC)))
+                continue  # <-- this 'continue' IS inside 'while', so it’s valid
 
         for sym in valid_symbols:
             try:
