@@ -340,6 +340,12 @@ from threading import Thread, Event
 from decimal import Decimal
 from datetime import datetime
 
+# --- ensure DECISIONS exists (near the top, after deque import) ---
+try:
+    DECISIONS
+except NameError:
+    DECISIONS = deque(maxlen=int(os.getenv("DECISIONS_MAX", "2000")))
+
 # --- knobs ---
 def env_true(name, default="false"):
     return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
@@ -1016,11 +1022,38 @@ def _auto_stop_view():
     _auto["stop"].set()
     return jsonify(ok=True)
 
+# --- decisions view (replace your current _auto_decisions_view) ---
 def _auto_decisions_view():
+    # accept admin token or logged-in session
     if not (session.get("user_id") or session.get("logged_in") or
             (ADMIN_TOKEN and request.headers.get("X-Admin-Token") == ADMIN_TOKEN)):
         return jsonify(ok=False, error="auth"), 401
-    return jsonify(ok=True, items=list(DECISIONS))
+    try:
+        lim = request.args.get("limit")
+        items = list(DECISIONS)
+        if lim:
+            try:
+                n = int(lim)
+                if n > 0:
+                    items = items[-n:]
+            except Exception:
+                pass
+        return jsonify(ok=True, items=items)
+    except Exception as e:
+        # never 500 without telling you why
+        return jsonify(ok=False, error=f"decisions: {e}"), 500
+
+# --- optional: clear endpoint (handy for testing) ---
+def _auto_decisions_clear_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    try:
+        DECISIONS.clear()
+        return jsonify(ok=True, cleared=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+_register("/auto/decisions/clear", "auto_decisions_clear", ["POST"], _auto_decisions_clear_view)
 
 # --- trailing control routes ---
 def _trail_enable_view():
