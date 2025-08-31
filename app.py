@@ -907,22 +907,26 @@ def auto_loop():
                                 sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
                             ) if fills else price
 
+                            # persist trade row
                             try:
                                 db.session.add(Trade(symbol=sym, side="SELL", amount=float(filled_qty),
                                                      price=float(avg_price), timestamp=datetime.utcnow(),
                                                      is_open=False, source="auto"))
                                 db.session.commit()
-                            except Exception:
+                             except Exception:
                                 db.session.rollback()
 
-                            try:
-                                pos = Position.query.filter_by(symbol=sym, status='OPEN').first()
-                                pos_id = pos.id if pos else None
-                            except Exception:
-                                pos_id = None
-                            record_order_row(o, 'SELL', sym, float(filled_qty), float(avg_price), position_id=pos_id)
+                             # attach to most recent open LONG, if it exists
+                             pos = None
+                             try:
+                                 pos = Position.query.filter_by(symbol=sym, side="LONG", is_open=True) \
+                                                     .order_by(Position.id.desc()).first()
+                             except Exception:
+                                 pos = None
 
-                            close_position_if_filled_sells(sym)
+                             record_order_row(o, 'SELL', sym, float(filled_qty), float(avg_price),
+                                              position_id=(pos.id if pos else None))
+                             close_position_if_filled_sells(sym)
 
                             app.logger.info("[AUTO] SELL %s qty=%s @ %.4f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
                             log_decision(sym, p2, q2, rsi_now, "SELL", "signal")
