@@ -339,6 +339,7 @@ from collections import deque
 from threading import Thread, Event
 from decimal import Decimal
 from datetime import datetime
+from binance.exceptions import BinanceAPIException
 
 # --- ensure DECISIONS exists (near the top, after deque import) ---
 try:
@@ -401,7 +402,14 @@ AUTO_MAX_BUYS_PER_MIN = int(os.getenv("AUTO_MAX_BUYS_PER_MIN", "3"))  # throttle
 # --- rate/weight controls ---
 AUTO_POLL_SEC        = int(os.getenv("AUTO_POLL_SEC", "30"))     # loop sleep
 ACCOUNT_REFRESH_N    = int(os.getenv("ACCOUNT_REFRESH_N", "6"))  # refresh balances every N loops
-BACKOFF_1003_SEC     = int(os.getenv("BACKOFF_1003_SEC", "60"))  # cooldown on rate-limit
+BACKOFF_1003_SEC     = int(os.getenv("BACKOFF_1003_SEC", "65"))  # cooldown on rate-limit
+
+# --- rate & exposure guards ---
+GLOBAL_COOLDOWN_SEC = int(os.getenv("GLOBAL_COOLDOWN_SEC", "5"))   # floor sleep in loop
+_PER_SYM_COOLDOWN_RAW = os.getenv("PER_SYMBOL_COOLDOWN", "").strip()  # e.g. "BTCUSDT:900,ETHUSDT:300"
+
+# Optional: override kline limit (0 => auto compute from indicators)
+KL_LIMIT = int(os.getenv("KL_LIMIT", "0"))
 
 _auto = {
     "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
@@ -713,7 +721,8 @@ def last_close_and_indicators(klines):
 # --- misc helpers ---
 def can_trade(symbol):
     last = _auto["last_trade_ts"].get(symbol, 0)
-    return (time.time() - last) >= AUTO_COOLDOWN_SEC
+    sym_cd = PER_SYMBOL_COOLDOWN.get((symbol or "").upper(), AUTO_COOLDOWN_SEC)
+    return (time.time() - last) >= sym_cd
 
 def record_trade_ts(symbol):
     _auto["last_trade_ts"][symbol] = time.time()
@@ -723,6 +732,27 @@ def require_admin():
         return True
     token = request.headers.get("X-Admin-Token")
     return bool(ADMIN_TOKEN) and token == ADMIN_TOKEN
+
+def parse_symbol_cooldowns(raw: str):
+    """
+    Parse 'BTCUSDT:900,ETHUSDT:300' -> {'BTCUSDT': 900, 'ETHUSDT': 300}
+    Invalid parts are ignored.
+    """
+    out = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            k, v = part.split(":", 1)
+            k = (k or "").strip().upper()
+            try:
+                out[k] = max(0, int((v or "").strip()))
+            except Exception:
+                pass
+    return out
+
+PER_SYMBOL_COOLDOWN = parse_symbol_cooldowns(_PER_SYM_COOLDOWN_RAW)
 
 def log_decision(sym, ema_fast_v, ema_slow_v, rsi_now, action, reason):
     DECISIONS.append({
@@ -734,6 +764,10 @@ def log_decision(sym, ema_fast_v, ema_slow_v, rsi_now, action, reason):
         "action": action,
         "reason": reason,
     })
+        # cap the buffer
+    if len(DECISIONS) > 500:
+        del DECISIONS[:-500]
+
     try:
         app.logger.info("[AUTO] %s | ef=%.6f es=%.6f rsi=%.2f -> %s (%s)",
                         sym, float(ema_fast_v or 0), float(ema_slow_v or 0), float(rsi_now or 0), action, reason)
@@ -791,6 +825,9 @@ def auto_loop():
         allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
         allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
+        kl_needed = max(EMA_SLOW, RSI_LEN, ATR_LEN) + 2
+        kl_limit = KL_LIMIT if KL_LIMIT > 0 else kl_needed
+
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
 
@@ -800,37 +837,33 @@ def auto_loop():
 
             bals = _auto.get("bals", {}) or {}
             need_refresh = (_auto["loop"] % max(ACCOUNT_REFRESH_N, 1)) == 0
-            if need_refresh:
-                try:
-                    acct = client.get_account()
-                    bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-                    _auto["bals"] = bals
-                except BinanceAPIException as e:
-                    if is_rate_limit_err(e):
-                        _auto["err"] = "rate-limit: -1003"
-                        log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
-                        try:
-                            app.logger.warning("[AUTO] rate-limit (-1003). Backing off %ss", BACKOFF_1003_SEC)
-                        except Exception:
-                            pass
-                        proceed = False
-                        sleep_after = BACKOFF_1003_SEC
-                    else:
-                        _auto["err"] = f"account: {e}"
-                        try:
-                            app.logger.warning("[AUTO] account error: %s", e)
-                        except Exception:
-                            pass
-                        proceed = False
-                        sleep_after = 10
-                except Exception as e:
-                    _auto["err"] = f"account: {e}"
+                if need_refresh:
                     try:
-                        app.logger.warning("[AUTO] account error: %s", e)
-                    except Exception:
-                        pass
-                    proceed = False
-                    sleep_after = 10
+                        acct = client.get_account()
+                        bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                        _auto["bals"] = bals
+                    except BinanceAPIException as e:
+                        msg = str(e)
+                        _auto["err"] = f"account: {msg}"
+                        try:
+                            app.logger.warning("[AUTO] account error: %s", msg)
+                        except Exception:
+                            pass
+                        if "-1003" in msg:  # request weight exceeded
+                            proceed = False
+                            sleep_after = max(sleep_after or 0, BACKOFF_1003_SEC)  # e.g. 65
+                            log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
+                        else:
+                             proceed = False
+                             sleep_after = max(sleep_after or 0, 10)
+                     except Exception as e:
+                         _auto["err"] = f"account: {e}"
+                         try:
+                             app.logger.warning("[AUTO] account error: %s", e)
+                         except Exception:
+                             pass
+                         proceed = False
+                         sleep_after = max(sleep_after or 0, 10)
 
             if not valid_symbols:
                 log_decision("ALL", None, None, None, "HOLD", "no-valid-symbols")
@@ -849,7 +882,19 @@ def auto_loop():
                     log_decision(sym, None, None, None, "HOLD", "cooldown")
                     continue
 
-                kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
+                    try:
+                        kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=kl_limit)
+                    except BinanceAPIException as e:
+                        msg = str(e)
+                        _auto["err"] = f"klines: {msg}"
+                        app.logger.warning("[AUTO] %s klines error: %s", sym, msg)
+                        if "-1003" in msg:
+                            _auto["stop"].wait(65)
+                        else:
+                            _auto["stop"].wait(5)
+                        log_decision(sym, None, None, None, "HOLD", "klines-error")
+                        continue
+
                 if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
                     log_decision(sym, None, None, None, "HOLD", "few-bars")
                     continue
@@ -868,10 +913,6 @@ def auto_loop():
                 bear_x = bear_cross or (allow_exit  and trend_dn)
 
                 price = float(closes[-1])  # reuse last close; saves a request per symbol
-                base = sym.replace("USDT", "")
-                base_bal = bals.get(base, 0.0)
-
-                price = float(closes[-1])  # reuse last close, avoids extra ticker call
                 base = sym.replace("USDT", "")
                 base_bal = bals.get(base, 0.0)
 
