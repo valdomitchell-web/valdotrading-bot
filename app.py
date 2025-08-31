@@ -394,11 +394,19 @@ SELL_RSI_MIN       = float(os.getenv("SELL_RSI_MIN", "45"))      # was 40
 PER_SYMBOL_MAX_USDT = float(os.getenv("PER_SYMBOL_MAX_USDT", "25"))   # cap per-symbol notional before allowing new buys
 AUTO_MAX_BUYS_PER_MIN = int(os.getenv("AUTO_MAX_BUYS_PER_MIN", "3"))  # throttle bursts on choppy bars
 
+# --- rate/weight controls ---
+AUTO_POLL_SEC        = int(os.getenv("AUTO_POLL_SEC", "30"))     # loop sleep
+ACCOUNT_REFRESH_N    = int(os.getenv("ACCOUNT_REFRESH_N", "6"))  # refresh balances every N loops
+BACKOFF_1003_SEC     = int(os.getenv("BACKOFF_1003_SEC", "60"))  # cooldown on rate-limit
+
 _auto = {
     "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
     "last_trade_ts": {},
-    "trails": {},                  # per-symbol trailing state
-    "panic_armed": False,          # kill-switch latch
+    "trails": {},
+    "panic_armed": False,
+    # new:
+    "loop": 0,
+    "bals": {},     # cached balances
 }
 
 # --- client ---
@@ -712,100 +720,13 @@ def confirmed_trend(ef, es, bars: int, side: str) -> bool:
     else:
         return all(ef[-i] < es[-i] for i in rng)
 
-# -------- Runtime config API (GET to read, POST to update) --------
-def _coerce_bool(v):
-    if isinstance(v, bool): return v
-    if v is None: return None
-    return str(v).strip().lower() in ("1","true","yes","y","on")
-
-def _as_config_dict():
-    return dict(
-        ENABLE_TPSL=ENABLE_TPSL, TP_PCT=TP_PCT, SL_PCT=SL_PCT,
-        ENABLE_TRAILING=ENABLE_TRAILING, TRAIL_ARM_PCT=TRAIL_ARM_PCT, TRAIL_PCT=TRAIL_PCT,
-        PANIC_MODE=PANIC_MODE, PANIC_RSI_BTC=PANIC_RSI_BTC, PANIC_RSI_ETH=PANIC_RSI_ETH,
-        EMA_FAST=EMA_FAST, EMA_SLOW=EMA_SLOW, RSI_LEN=RSI_LEN,
-        BUY_RSI_MAX=BUY_RSI_MAX, SELL_RSI_MIN=SELL_RSI_MIN,
-        CROSS_CONFIRM_BARS=CROSS_CONFIRM_BARS, EMA_SEP_BPS=EMA_SEP_BPS,
-        AUTO_INTERVAL=AUTO_INTERVAL, AUTO_RISK_USDT=AUTO_RISK_USDT,
-        AUTO_COOLDOWN_SEC=AUTO_COOLDOWN_SEC, AUTO_MAX_BUYS_PER_MIN=AUTO_MAX_BUYS_PER_MIN,
-        PER_SYMBOL_MAX_USDT=PER_SYMBOL_MAX_USDT,
-        ALLOW_TREND_ENTRY=ALLOW_TREND_ENTRY, ALLOW_TREND_EXIT=ALLOW_TREND_EXIT,
-        AUTO_SYMBOLS=AUTO_SYMBOLS,
-        PANIC_ARMED=_auto.get("panic_armed", False),
-        AUTO_ENABLED=_auto.get("enabled", False),
-    )
-
-def _auto_config_view():
-    if not require_admin():
-        return jsonify(ok=False, error="auth"), 401
-    if request.method == "GET":
-        return jsonify(ok=True, config=_as_config_dict())
-
-    # POST (update)
-    data = request.get_json(silent=True) or {}
-
-    # Allowed keys and coercions
-    bool_keys  = ["ENABLE_TPSL","ENABLE_TRAILING","ALLOW_TREND_ENTRY","ALLOW_TREND_EXIT"]
-    float_keys = ["TP_PCT","SL_PCT","TRAIL_ARM_PCT","TRAIL_PCT","PANIC_RSI_BTC","PANIC_RSI_ETH",
-                  "BUY_RSI_MAX","SELL_RSI_MIN","EMA_SEP_BPS","AUTO_RISK_USDT","PER_SYMBOL_MAX_USDT"]
-    int_keys   = ["EMA_FAST","EMA_SLOW","RSI_LEN","AUTO_COOLDOWN_SEC","AUTO_MAX_BUYS_PER_MIN","CROSS_CONFIRM_BARS"]
-    str_keys   = ["PANIC_MODE","AUTO_INTERVAL"]
-
-    updated = {}
-
-    for k in bool_keys:
-        if k in data:
-            globals()[k] = _coerce_bool(data[k])
-            updated[k] = globals()[k]
-    for k in float_keys:
-        if k in data:
-            try:
-                globals()[k] = float(data[k])
-                updated[k] = globals()[k]
-            except Exception:
-                pass
-    for k in int_keys:
-        if k in data:
-            try:
-                globals()[k] = int(data[k])
-                updated[k] = globals()[k]
-            except Exception:
-                pass
-    for k in str_keys:
-        if k in data:
-            globals()[k] = str(data[k])
-            updated[k] = globals()[k]
-
-    # Special cases
-    if "AUTO_SYMBOLS" in data and isinstance(data["AUTO_SYMBOLS"], (list, str)):
-        if isinstance(data["AUTO_SYMBOLS"], list):
-            AUTO_SYMBOLS[:] = [str(s).upper() for s in data["AUTO_SYMBOLS"]]
-        else:
-            AUTO_SYMBOLS[:] = [s.strip().upper() for s in str(data["AUTO_SYMBOLS"]).split(",") if s.strip()]
-        updated["AUTO_SYMBOLS"] = AUTO_SYMBOLS
-
-    if "AUTO_ENABLED" in data:
-        _auto["enabled"] = _coerce_bool(data["AUTO_ENABLED"])
-        updated["AUTO_ENABLED"] = _auto["enabled"]
-
-    if "PANIC_ARMED" in data:
-        _auto["panic_armed"] = _coerce_bool(data["PANIC_ARMED"])
-        updated["PANIC_ARMED"] = _auto["panic_armed"]
-
-    # Small guardrails
-    if TP_PCT < 0:  globals()["TP_PCT"] = 0.0
-    if SL_PCT < 0:  globals()["SL_PCT"] = 0.0
-    if TRAIL_PCT < 0: globals()["TRAIL_PCT"] = 0.0
-
+def is_rate_limit_err(e) -> bool:
     try:
-        app.logger.info("[AUTO] config updated: %s", updated)
+        # BinanceAPIException has code attr; fallback to message scan
+        return getattr(e, "code", None) == -1003 or "-1003" in str(e)
     except Exception:
-        pass
-
-    return jsonify(ok=True, updated=updated, config=_as_config_dict())
-
-_register("/auto/config", "auto_config", ["GET","POST"], _auto_config_view)
-
+        return False
+        
 # --- main loop ---
 def auto_loop():
     # All DB work in this thread happens under an app context
@@ -840,10 +761,26 @@ def auto_loop():
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
 
-            # account balances (for "already holding?" logic)
+        # account balances (cached; only refresh every ACCOUNT_REFRESH_N loops)
+        bals = _auto.get("bals", {}) or {}
+        need_refresh = (_auto["loop"] % max(ACCOUNT_REFRESH_N, 1)) == 0
+        if need_refresh:
             try:
                 acct = client.get_account()
                 bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                _auto["bals"] = bals
+            except BinanceAPIException as e:
+                if is_rate_limit_err(e):
+                    _auto["err"] = "rate-limit: -1003"
+                    log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
+                    app.logger.warning("[AUTO] rate-limit (-1003). Backing off %ss", BACKOFF_1003_SEC)
+                    _auto["stop"].wait(BACKOFF_1003_SEC)
+                    continue
+                else:
+                    _auto["err"] = f"account: {e}"
+                    app.logger.warning("[AUTO] account error: %s", e)
+                    _auto["stop"].wait(10)
+                    continue
             except Exception as e:
                 _auto["err"] = f"account: {e}"
                 app.logger.warning("[AUTO] account error: %s", e)
@@ -852,7 +789,8 @@ def auto_loop():
 
             if not valid_symbols:
                 log_decision("ALL", None, None, None, "HOLD", "no-valid-symbols")
-                _auto["stop"].wait(30)
+               _auto["loop"] += 1
+               _auto["stop"].wait(max(1, AUTO_POLL_SEC))
                 continue
 
         for sym in valid_symbols:
@@ -879,7 +817,7 @@ def auto_loop():
                 bull_x = bull_cross or (allow_entry and trend_up)
                 bear_x = bear_cross or (allow_exit  and trend_dn)
 
-                price = float(client.get_symbol_ticker(symbol=sym)["price"])
+                price = float(closes[-1])  # reuse last close; saves a request per symbol
                 base = sym.replace("USDT", "")
                 base_bal = bals.get(base, 0.0)
 
@@ -1086,6 +1024,99 @@ def _register(rule: str, endpoint: str, methods, view_func):
     _replace_route(rule, endpoint)
     app.add_url_rule(rule, endpoint=endpoint, view_func=view_func, methods=methods)
 
+# -------- Runtime config API (GET to read, POST to update) --------
+def _coerce_bool(v):
+    if isinstance(v, bool): return v
+    if v is None: return None
+    return str(v).strip().lower() in ("1","true","yes","y","on")
+
+def _as_config_dict():
+    return dict(
+        ENABLE_TPSL=ENABLE_TPSL, TP_PCT=TP_PCT, SL_PCT=SL_PCT,
+        ENABLE_TRAILING=ENABLE_TRAILING, TRAIL_ARM_PCT=TRAIL_ARM_PCT, TRAIL_PCT=TRAIL_PCT,
+        PANIC_MODE=PANIC_MODE, PANIC_RSI_BTC=PANIC_RSI_BTC, PANIC_RSI_ETH=PANIC_RSI_ETH,
+        EMA_FAST=EMA_FAST, EMA_SLOW=EMA_SLOW, RSI_LEN=RSI_LEN,
+        BUY_RSI_MAX=BUY_RSI_MAX, SELL_RSI_MIN=SELL_RSI_MIN,
+        CROSS_CONFIRM_BARS=CROSS_CONFIRM_BARS, EMA_SEP_BPS=EMA_SEP_BPS,
+        AUTO_INTERVAL=AUTO_INTERVAL, AUTO_RISK_USDT=AUTO_RISK_USDT,
+        AUTO_COOLDOWN_SEC=AUTO_COOLDOWN_SEC, AUTO_MAX_BUYS_PER_MIN=AUTO_MAX_BUYS_PER_MIN,
+        PER_SYMBOL_MAX_USDT=PER_SYMBOL_MAX_USDT,
+        ALLOW_TREND_ENTRY=ALLOW_TREND_ENTRY, ALLOW_TREND_EXIT=ALLOW_TREND_EXIT,
+        AUTO_SYMBOLS=AUTO_SYMBOLS,
+        PANIC_ARMED=_auto.get("panic_armed", False),
+        AUTO_ENABLED=_auto.get("enabled", False),
+    )
+
+def _auto_config_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    if request.method == "GET":
+        return jsonify(ok=True, config=_as_config_dict())
+
+    # POST (update)
+    data = request.get_json(silent=True) or {}
+
+    # Allowed keys and coercions
+    bool_keys  = ["ENABLE_TPSL","ENABLE_TRAILING","ALLOW_TREND_ENTRY","ALLOW_TREND_EXIT"]
+    float_keys = ["TP_PCT","SL_PCT","TRAIL_ARM_PCT","TRAIL_PCT","PANIC_RSI_BTC","PANIC_RSI_ETH",
+                  "BUY_RSI_MAX","SELL_RSI_MIN","EMA_SEP_BPS","AUTO_RISK_USDT","PER_SYMBOL_MAX_USDT"]
+    int_keys   = ["EMA_FAST","EMA_SLOW","RSI_LEN","AUTO_COOLDOWN_SEC","AUTO_MAX_BUYS_PER_MIN","CROSS_CONFIRM_BARS"]
+    str_keys   = ["PANIC_MODE","AUTO_INTERVAL"]
+
+    updated = {}
+
+    for k in bool_keys:
+        if k in data:
+            globals()[k] = _coerce_bool(data[k])
+            updated[k] = globals()[k]
+    for k in float_keys:
+        if k in data:
+            try:
+                globals()[k] = float(data[k])
+                updated[k] = globals()[k]
+            except Exception:
+                pass
+    for k in int_keys:
+        if k in data:
+            try:
+                globals()[k] = int(data[k])
+                updated[k] = globals()[k]
+            except Exception:
+                pass
+    for k in str_keys:
+        if k in data:
+            globals()[k] = str(data[k])
+            updated[k] = globals()[k]
+
+    # Special cases
+    if "AUTO_SYMBOLS" in data and isinstance(data["AUTO_SYMBOLS"], (list, str)):
+        if isinstance(data["AUTO_SYMBOLS"], list):
+            AUTO_SYMBOLS[:] = [str(s).upper() for s in data["AUTO_SYMBOLS"]]
+        else:
+            AUTO_SYMBOLS[:] = [s.strip().upper() for s in str(data["AUTO_SYMBOLS"]).split(",") if s.strip()]
+        updated["AUTO_SYMBOLS"] = AUTO_SYMBOLS
+
+    if "AUTO_ENABLED" in data:
+        _auto["enabled"] = _coerce_bool(data["AUTO_ENABLED"])
+        updated["AUTO_ENABLED"] = _auto["enabled"]
+
+    if "PANIC_ARMED" in data:
+        _auto["panic_armed"] = _coerce_bool(data["PANIC_ARMED"])
+        updated["PANIC_ARMED"] = _auto["panic_armed"]
+
+    # Small guardrails
+    if TP_PCT < 0:  globals()["TP_PCT"] = 0.0
+    if SL_PCT < 0:  globals()["SL_PCT"] = 0.0
+    if TRAIL_PCT < 0: globals()["TRAIL_PCT"] = 0.0
+
+    try:
+        app.logger.info("[AUTO] config updated: %s", updated)
+    except Exception:
+        pass
+
+    return jsonify(ok=True, updated=updated, config=_as_config_dict())
+
+_register("/auto/config", "auto_config", ["GET","POST"], _auto_config_view)
 
 # --- views (plain functions) ---
 def _auto_status_view():
