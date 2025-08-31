@@ -913,7 +913,7 @@ def auto_loop():
                                                      price=float(avg_price), timestamp=datetime.utcnow(),
                                                      is_open=False, source="auto"))
                                 db.session.commit()
-                             except Exception:
+                            except Exception:
                                 db.session.rollback()
 
                              # attach to most recent open LONG, if it exists
