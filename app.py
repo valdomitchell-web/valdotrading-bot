@@ -1144,7 +1144,7 @@ def auto_loop():
                     # Log why we didn’t buy even though there was a signal
                     reason = "loss-cooldown-active" if cooldown_active else "portfolio-cap"
                     log_decision(sym, p2, q2, rsi_now, "HOLD", reason)
-                )
+                
                     try:
                         o = client.create_order(
                             symbol=sym,
