@@ -1464,7 +1464,7 @@ def _auto_health_view():
                        cooldown_active=(_auto.get("cooldown_until", 0) > time.time()),
                        cooldown_ends_at=_auto.get("cooldown_until", 0),
                        portfolio_cap=PORTFOLIO_MAX_USDT)
-)
+#)
 
 _register("/auto/health", "auto_health_v2", ["GET"], _auto_health_view)
 
