@@ -431,6 +431,10 @@ PORTFOLIO_MAX_USDT = float(os.getenv("PORTFOLIO_MAX_USDT", "120"))  # total cap 
 MAX_LOSS_STREAK    = int(os.getenv("MAX_LOSS_STREAK", "3"))         # how many losing closes in a row
 LOSS_COOLDOWN_SEC  = int(os.getenv("LOSS_COOLDOWN_SEC", "900"))      # 15 minutes cooldown
 
+# ---- trading schedule (UTC) ----
+# CSV of HH:MM-HH:MM windows; example: "00:00-23:59" (always on) or "12:00-16:00,20:00-22:00"
+TIME_WINDOWS_UTC = os.getenv("TIME_WINDOWS_UTC", "00:00-23:59")
+
 # --- ensure DECISIONS exists (near the top, after deque import) ---
 try:
     DECISIONS
@@ -504,6 +508,37 @@ def get_open_long_avg_price(symbol: str):
         return float(pos.avg_price) if pos else None
     except Exception:
         return None
+
+def _parse_time(s):
+    hh, mm = s.split(":")
+    return int(hh), int(mm)
+
+def _parse_windows(spec: str):
+    wins = []
+    for part in (spec or "").split(","):
+        p = part.strip()
+        if not p or "-" not in p: 
+            continue
+        a, b = [x.strip() for x in p.split("-", 1)]
+        try:
+            h1, m1 = _parse_time(a)
+            h2, m2 = _parse_time(b)
+            wins.append(((h1, m1), (h2, m2)))
+        except Exception:
+            pass
+    return wins
+
+_SCHED_WINS = _parse_windows(TIME_WINDOWS_UTC)
+
+def schedule_allows_now_utc() -> bool:
+    now = datetime.utcnow()
+    t = (now.hour, now.minute)
+    for (h1, m1), (h2, m2) in _SCHED_WINS:
+        start_ok = (t >= (h1, m1))
+        end_ok   = (t <= (h2, m2))
+        if start_ok and end_ok:
+            return True
+    return False
 
 # --- trailing manager ---
 def ensure_trail_state(symbol: str, avg_price: float):
@@ -1121,7 +1156,9 @@ def auto_loop():
                 spend = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
                 cap_left = max(0.0, float(PORTFOLIO_MAX_USDT) - float(portfolio_notional))
                 cap_ok   = (spend <= cap_left)
-
+                
+                window_ok = schedule_allows_now_utc()
+                
                 if (
                     _auto["enabled"]
                     and (not _auto.get("panic_armed", False))
@@ -1137,13 +1174,9 @@ def auto_loop():
                     # after successful BUY, reflect the spend in portfolio_notional for subsequent symbols
                     portfolio_notional += spend
                 elif (
-                    _auto["enabled"]
-                    and buy_ok
-                    and (cooldown_active or not cap_ok)
+                    _auto["enabled"] and buy_ok and not window_ok
                 ):
-                    # Log why we didn’t buy even though there was a signal
-                    reason = "loss-cooldown-active" if cooldown_active else "portfolio-cap"
-                    log_decision(sym, p2, q2, rsi_now, "HOLD", reason)
+                    log_decision(sym, p2, q2, rsi_now, "HOLD", "window-closed")
                 
                     try:
                         o = client.create_order(
@@ -1308,8 +1341,8 @@ def _as_config_dict():
         DYN_RISK_MIN_USDT=DYN_RISK_MIN_USDT, DYN_RISK_MAX_USDT=DYN_RISK_MAX_USDT,
         ACCOUNT_REFRESH_N=ACCOUNT_REFRESH_N, BACKOFF_1003_SEC=BACKOFF_1003_SEC,
         AUTO_POLL_SEC=AUTO_POLL_SEC, DECISIONS_MAX=DECISIONS_MAX,
+        TIME_WINDOWS_UTC=TIME_WINDOWS_UTC
     )
-
 
 def _auto_config_view():
     if not require_admin():
@@ -1334,7 +1367,11 @@ def _auto_config_view():
     ]
     str_keys   = ["PANIC_MODE","AUTO_INTERVAL"]
     float_keys += ["PORTFOLIO_MAX_USDT"]
+    str_keys += ["TIME_WINDOWS_UTC"]
     int_keys   += ["MAX_LOSS_STREAK","LOSS_COOLDOWN_SEC"]
+    
+    if "TIME_WINDOWS_UTC" in data:
+    globals()["_SCHED_WINS"] = _parse_windows(TIME_WINDOWS_UTC) 
 
     updated = {}
 
@@ -1456,15 +1493,23 @@ _register("/auto/decisions/clear", "auto_decisions_clear", ["POST"], _auto_decis
 def _auto_health_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-        return jsonify(ok=True,
-                       running=bool(_auto["thread"] and _auto["thread"].is_alive()),
-                       enabled=_auto["enabled"],
-                       panic=bool(_auto.get("panic_armed", False)),
-                       loop=int(_auto.get("loop", 0)),
-                       cooldown_active=(_auto.get("cooldown_until", 0) > time.time()),
-                       cooldown_ends_at=_auto.get("cooldown_until", 0),
-                       portfolio_cap=PORTFOLIO_MAX_USDT)
-#)
+    try:
+        now_ts = time.time()
+        return jsonify(
+            ok=True,
+            running=bool(_auto.get("thread") and _auto["thread"].is_alive()),
+            enabled=bool(_auto.get("enabled")),
+            panic=bool(_auto.get("panic_armed", False)),
+            loop=int(_auto.get("loop", 0)),
+            last=_auto.get("last"),
+            err=_auto.get("err"),
+            cooldown_active=(_auto.get("cooldown_until", 0) > now_ts),
+            cooldown_ends_at=float(_auto.get("cooldown_until", 0) or 0),
+            portfolio_cap=float(globals().get("PORTFOLIO_MAX_USDT", 0.0)),
+        )
+    except Exception as e:
+        # never return HTML
+        return jsonify(ok=False, error=f"health: {e}"), 200
 
 _register("/auto/health", "auto_health_v2", ["GET"], _auto_health_view)
 
@@ -1556,12 +1601,19 @@ def _auto_step_view():
     allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
     allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
+    win_open = schedule_allows_now_utc()
+   "window":"open" if win_open else "closed"
+
     for sym in AUTO_SYMBOLS:
         try:
             kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
-            if not kl:
-                items.append({"symbol": sym, "error": "no klines"})
-                continue
+    except BinanceAPIException as e:
+        msg = str(e)
+        if "-1003" in msg:
+            items.append({"symbol": sym, "error": "rate-limit-1003", "hint": "backoff"})
+            continue
+        items.append({"symbol": sym, "error": msg})
+        continue
 
             closes, ef, es, r = last_close_and_indicators(kl)
             p1, p2 = ef[-2], ef[-1]
