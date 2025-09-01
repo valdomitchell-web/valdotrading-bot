@@ -341,12 +341,6 @@ from decimal import Decimal
 from datetime import datetime
 from binance.exceptions import BinanceAPIException
 
-# --- ensure DECISIONS exists (near the top, after deque import) ---
-try:
-    DECISIONS
-except NameError:
-    DECISIONS = deque(maxlen=DECISIONS_MAX)
-
 # --- knobs ---
 def env_true(name, default="false"):
     return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
@@ -437,6 +431,12 @@ PORTFOLIO_MAX_USDT = float(os.getenv("PORTFOLIO_MAX_USDT", "120"))  # total cap 
 MAX_LOSS_STREAK    = int(os.getenv("MAX_LOSS_STREAK", "3"))         # how many losing closes in a row
 LOSS_COOLDOWN_SEC  = int(os.getenv("LOSS_COOLDOWN_SEC", "900"))      # 15 minutes cooldown
 
+# --- ensure DECISIONS exists (near the top, after deque import) ---
+try:
+    DECISIONS
+except NameError:
+    DECISIONS = deque(maxlen=DECISIONS_MAX)
+    
 _auto = {
     "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
     "last_trade_ts": {},
