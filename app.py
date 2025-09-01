@@ -1620,12 +1620,12 @@ def _auto_step_view():
                 elif base_bal * price >= min_notional:
                     reason = "have-base"
 
-        spend_planned = None
-        cap_reason = None
-        if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
-            spend_planned = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
-            # approximate portfolio cap using per-symbol notional (best-effort)
-            # (You can make this exact by tracking a local `portfolio_notional` like the main loop.)
+                spend_planned = None
+                cap_reason = None
+                if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
+                    spend_planned = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
+                    # approximate portfolio cap using per-symbol notional (best-effort)
+                    # (You can make this exact by tracking a local `portfolio_notional` like the main loop.)
 
             items.append({
                 "symbol": sym,
