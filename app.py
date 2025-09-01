@@ -1364,7 +1364,7 @@ def _auto_decisions_clear_view():
 
 _register("/auto/decisions/clear", "auto_decisions_clear", ["POST"], _auto_decisions_clear_view)
 
-    def _auto_health_view():
+def _auto_health_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
     return jsonify(
