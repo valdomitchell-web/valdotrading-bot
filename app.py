@@ -1308,7 +1308,6 @@ def _as_config_dict():
         DYN_RISK_MIN_USDT=DYN_RISK_MIN_USDT, DYN_RISK_MAX_USDT=DYN_RISK_MAX_USDT,
         ACCOUNT_REFRESH_N=ACCOUNT_REFRESH_N, BACKOFF_1003_SEC=BACKOFF_1003_SEC,
         AUTO_POLL_SEC=AUTO_POLL_SEC, DECISIONS_MAX=DECISIONS_MAX,
-        "spend_planned": round(spend_planned, 2) if spend_planned is not None else None,
     )
 
 
