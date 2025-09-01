@@ -345,7 +345,7 @@ from binance.exceptions import BinanceAPIException
 try:
     DECISIONS
 except NameError:
-    DECISIONS = deque(maxlen=int(os.getenv("DECISIONS_MAX", "2000")))
+    DECISIONS = deque(maxlen=DECISIONS_MAX)
 
 # --- knobs ---
 def env_true(name, default="false"):
@@ -431,6 +431,12 @@ AUTO_POLL_SEC     = int(os.getenv("AUTO_POLL_SEC", "30"))
 # --- decisions cap (ring buffer) ---
 DECISIONS_MAX = int(os.getenv("DECISIONS_MAX", "500"))
 
+# ---- portfolio & loss-streak guards ----
+PORTFOLIO_MAX_USDT = float(os.getenv("PORTFOLIO_MAX_USDT", "120"))  # total cap across AUTO_SYMBOLS
+
+MAX_LOSS_STREAK    = int(os.getenv("MAX_LOSS_STREAK", "3"))         # how many losing closes in a row
+LOSS_COOLDOWN_SEC  = int(os.getenv("LOSS_COOLDOWN_SEC", "900"))      # 15 minutes cooldown
+
 _auto = {
     "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
     "last_trade_ts": {},
@@ -438,6 +444,7 @@ _auto = {
     "panic_armed": False,
     "loop": 0,              # <— add
     "bals": {},             # <— add
+    "cooldown_until": 0,  # unix ts until which buys are paused due to loss streak
 }
 
 # --- client ---
@@ -630,6 +637,28 @@ def eval_tpsl_and_maybe_sell(client, symbol: str, price: float, base_bal: float,
         _auto["err"] = str(e)
         return False
 
+def current_loss_streak(limit: int = 10) -> int:
+    """
+    Count consecutive losing CLOSED positions from most-recent backwards.
+    Stops on first non-loss or after `limit` positions.
+    """
+    try:
+        rows = (Position.query
+                .filter_by(status='CLOSED')
+                .order_by(Position.id.desc())
+                .limit(limit)
+                .all())
+        c = 0
+        for p in rows:
+            pnl = float(p.realized_pnl or 0.0)
+            if pnl < 0:
+                c += 1
+            else:
+                break
+        return c
+    except Exception:
+        return 0
+        
 # --- panic hedge (STOP/LIQUIDATE) ---
 def panic_check_and_maybe_trigger(rsi_map):
     """
@@ -835,6 +864,31 @@ def log_decision(sym, ema_fast_v, ema_slow_v, rsi_now, action, reason):
 def ema_sep_bps(ef_v, es_v):
     return abs(ef_v - es_v) / max(es_v, 1e-12) * 10_000.0
 
+def dynamic_spend_for_atr(atr_pct: float) -> float:
+    """
+    Map volatility to spend:
+      - At/below ATR_MIN_PCT  -> spend = DYN_RISK_MAX_USDT
+      - At/above ATR_MAX_PCT  -> spend = DYN_RISK_MIN_USDT
+      - Linear interpolation in between.
+    Falls back to AUTO_RISK_USDT if DYN_RISK is off or atr is missing.
+    """
+    if (not DYN_RISK) or (atr_pct is None):
+        return float(AUTO_RISK_USDT)
+
+    lo, hi = float(ATR_MIN_PCT), float(ATR_MAX_PCT)
+    if hi <= lo:  # guard
+        return float(AUTO_RISK_USDT)
+
+    if atr_pct <= lo:
+        base = float(DYN_RISK_MAX_USDT)
+    elif atr_pct >= hi:
+        base = float(DYN_RISK_MIN_USDT)
+    else:
+        t = (atr_pct - lo) / (hi - lo)
+        base = (float(DYN_RISK_MAX_USDT) * (1.0 - t)) + (float(DYN_RISK_MIN_USDT) * t)
+
+    return float(base)
+    
 def confirmed_trend(ef, es, bars: int, side: str) -> bool:
     """Ensure the EMAs have agreed for the last N closed bars to reduce fake crosses."""
     if bars <= 0:
@@ -892,6 +946,23 @@ def auto_loop():
             # --- balances: cached fetch with 1003 backoff, no 'continue' needed ---
             proceed = True
             sleep_after = None
+
+          # --- loss-streak cooldown state ---
+            now_ts = time.time()
+            cooldown_active = (_auto.get("cooldown_until", 0) > now_ts)
+
+            if not cooldown_active:
+                try:
+                    ls = current_loss_streak()
+                    if ls >= MAX_LOSS_STREAK:
+                        _auto["cooldown_until"] = now_ts + LOSS_COOLDOWN_SEC
+                        cooldown_active = True
+                        log_decision("ALL", None, None, None, "HOLD", "loss-cooldown-start")
+                except Exception:
+                    pass
+
+            # --- portfolio usage tracker for this tick (built from balances while we loop) ---
+            portfolio_notional = 0.0
 
             bals = _auto.get("bals", {}) or {}
             need_refresh = (_auto["loop"] % max(ACCOUNT_REFRESH_N, 1)) == 0
@@ -1034,7 +1105,9 @@ def auto_loop():
 
                 # --- exposure guards ---
                 symbol_notional = base_bal * price
+                portfolio_notional += float(symbol_notional)
                 under_cap = (symbol_notional < PER_SYMBOL_MAX_USDT)
+
 
                 # --- burst throttle (per-minute) ---
                 now_min = int(time.time() // 60)
@@ -1044,23 +1117,34 @@ def auto_loop():
                 can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
 
                 # -------------------- BUY (use quoteOrderQty) --------------------
+                # planned spend from ATR (already computed atr_pct above)
+                spend = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
+                cap_left = max(0.0, float(PORTFOLIO_MAX_USDT) - float(portfolio_notional))
+                cap_ok   = (spend <= cap_left)
+
                 if (
                     _auto["enabled"]
-                    and not _auto.get("panic_armed", False)
+                    and (not _auto.get("panic_armed", False))
+                    and (not cooldown_active)
                     and buy_ok
                     and rsi_now <= BUY_RSI_MAX
                     and base_bal * price < min_notional
                     and under_cap
+                    and cap_ok
                     and can_add_buy
                 ):
-                    spend = max(AUTO_RISK_USDT, min_notional)  # base spend
-                    if DYN_RISK and (atr_pct is not None):
-                        # ATR% -> dynamic spend around baseline AUTO_RISK_USDT
-                        dyn = (atr_pct / 100.0) * DYN_RISK_MULT * AUTO_RISK_USDT
-                        spend = min(
-                            max(dyn, max(DYN_RISK_MIN_USDT, min_notional)),
-                            DYN_RISK_MAX_USDT
-                        )
+                    # ... (BUY execution body unchanged) ...
+                    # after successful BUY, reflect the spend in portfolio_notional for subsequent symbols
+                    portfolio_notional += spend
+                elif (
+                    _auto["enabled"]
+                    and buy_ok
+                    and (cooldown_active or not cap_ok)
+                ):
+                    # Log why we didn’t buy even though there was a signal
+                    reason = "loss-cooldown-active" if cooldown_active else "portfolio-cap"
+                    log_decision(sym, p2, q2, rsi_now, "HOLD", reason)
+                )
                     try:
                         o = client.create_order(
                             symbol=sym,
@@ -1215,12 +1299,16 @@ def _as_config_dict():
         AUTO_SYMBOLS=AUTO_SYMBOLS,
         PANIC_ARMED=_auto.get("panic_armed", False),
         AUTO_ENABLED=_auto.get("enabled", False),
+        PORTFOLIO_MAX_USDT=PORTFOLIO_MAX_USDT,
+        MAX_LOSS_STREAK=MAX_LOSS_STREAK,
+        LOSS_COOLDOWN_SEC=LOSS_COOLDOWN_SEC,
         # NEW
         ATR_LEN=ATR_LEN, ATR_MIN_PCT=ATR_MIN_PCT, ATR_MAX_PCT=ATR_MAX_PCT, KL_LIMIT=KL_LIMIT,
         DYN_RISK=DYN_RISK, DYN_RISK_MULT=DYN_RISK_MULT,
         DYN_RISK_MIN_USDT=DYN_RISK_MIN_USDT, DYN_RISK_MAX_USDT=DYN_RISK_MAX_USDT,
         ACCOUNT_REFRESH_N=ACCOUNT_REFRESH_N, BACKOFF_1003_SEC=BACKOFF_1003_SEC,
         AUTO_POLL_SEC=AUTO_POLL_SEC, DECISIONS_MAX=DECISIONS_MAX,
+        "spend_planned": round(spend_planned, 2) if spend_planned is not None else None,
     )
 
 
@@ -1246,6 +1334,8 @@ def _auto_config_view():
         "AUTO_POLL_SEC","DECISIONS_MAX"
     ]
     str_keys   = ["PANIC_MODE","AUTO_INTERVAL"]
+    float_keys += ["PORTFOLIO_MAX_USDT"]
+    int_keys   += ["MAX_LOSS_STREAK","LOSS_COOLDOWN_SEC"]
 
     updated = {}
 
@@ -1367,15 +1457,15 @@ _register("/auto/decisions/clear", "auto_decisions_clear", ["POST"], _auto_decis
 def _auto_health_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-    return jsonify(
-        ok=True,
-        running=bool(_auto["thread"] and _auto["thread"].is_alive()),
-        enabled=_auto["enabled"],
-        panic=_auto.get("panic_armed", False),
-        last=_auto["last"],
-        loop=_auto.get("loop", 0),
-        err=_auto["err"],
-    )
+   return jsonify(ok=True,
+               running=bool(_auto["thread"] and _auto["thread"].is_alive()),
+               enabled=_auto["enabled"],
+               panic=bool(_auto.get("panic_armed", False)),
+               loop=int(_auto.get("loop", 0)),
+               cooldown_active=(_auto.get("cooldown_until", 0) > time.time()),
+               cooldown_ends_at=_auto.get("cooldown_until", 0),
+               portfolio_cap=PORTFOLIO_MAX_USDT)
+)
 
 _register("/auto/health", "auto_health_v2", ["GET"], _auto_health_view)
 
@@ -1530,7 +1620,14 @@ def _auto_step_view():
                     action, reason = "SELL", "signal"
                 elif base_bal * price >= min_notional:
                     reason = "have-base"
-   
+
+        spend_planned = None
+        cap_reason = None
+        if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
+            spend_planned = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
+            # approximate portfolio cap using per-symbol notional (best-effort)
+            # (You can make this exact by tracking a local `portfolio_notional` like the main loop.)
+
             items.append({
                 "symbol": sym,
                 "ef": round(p2, 6), "es": round(q2, 6),
