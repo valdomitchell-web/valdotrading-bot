@@ -1456,14 +1456,14 @@ _register("/auto/decisions/clear", "auto_decisions_clear", ["POST"], _auto_decis
 def _auto_health_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-   return jsonify(ok=True,
-               running=bool(_auto["thread"] and _auto["thread"].is_alive()),
-               enabled=_auto["enabled"],
-               panic=bool(_auto.get("panic_armed", False)),
-               loop=int(_auto.get("loop", 0)),
-               cooldown_active=(_auto.get("cooldown_until", 0) > time.time()),
-               cooldown_ends_at=_auto.get("cooldown_until", 0),
-               portfolio_cap=PORTFOLIO_MAX_USDT)
+        return jsonify(ok=True,
+                       running=bool(_auto["thread"] and _auto["thread"].is_alive()),
+                       enabled=_auto["enabled"],
+                       panic=bool(_auto.get("panic_armed", False)),
+                       loop=int(_auto.get("loop", 0)),
+                       cooldown_active=(_auto.get("cooldown_until", 0) > time.time()),
+                       cooldown_ends_at=_auto.get("cooldown_until", 0),
+                       portfolio_cap=PORTFOLIO_MAX_USDT)
 )
 
 _register("/auto/health", "auto_health_v2", ["GET"], _auto_health_view)
