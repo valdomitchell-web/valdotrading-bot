@@ -445,7 +445,6 @@ try:
     DECISIONS
 except NameError:
     DECISIONS = deque(maxlen=DECISIONS_MAX)
-    
 _auto = {
     "thread": None, "stop": Event(), "enabled": False, "last": None, "err": None,
     "last_trade_ts": {},
@@ -455,6 +454,28 @@ _auto = {
     "bals": {},             # <— add
     "cooldown_until": 0,  # unix ts until which buys are paused due to loss streak
 }
+
+# add a bucket for per-symbol overrides
+_auto.setdefault("overrides", {})   # shape: { "ETHUSDT": { ... } }
+
+def get_overrides(sym: str) -> dict:
+    return (_auto.get("overrides") or {}).get(sym, {}) or {}
+
+def effective_trailing(sym: str, default_active: bool, default_arm: float, default_trail: float):
+    ov = get_overrides(sym)
+    return (
+        bool(ov.get("trailing_active", default_active)),
+        float(ov.get("trail_arm_pct", default_arm)),
+        float(ov.get("trail_pct", default_trail)),
+    )
+
+def effective_tpsl(sym: str, default_active: bool, default_tp: float, default_sl: float):
+    ov = get_overrides(sym)
+    return (
+        bool(ov.get("tpsl_active", default_active)),
+        float(ov.get("tp_pct", default_tp)),
+        float(ov.get("sl_pct", default_sl)),
+    )
 
 # --- client ---
 def make_client():
@@ -553,19 +574,28 @@ def new_coid(prefix: str, sym: str) -> str:
     # short, unique clientOrderId to dedup exchange retries
     return f"{prefix}-{sym}-{int(time.time()*1000)%10_000_000_000}"
     
-# --- trailing manager ---
 def ensure_trail_state(symbol: str, avg_price: float):
+    # pull effective per-symbol settings (overrides fall back to globals)
+    active, arm_pct, trail_pct = effective_trailing(symbol, ENABLE_TRAILING, TRAIL_ARM_PCT, TRAIL_PCT)
+
     st = _auto["trails"].get(symbol)
     if not st:
         st = {
-            "active": ENABLE_TRAILING,
+            "active": active,
             "armed": False,
-            "arm_pct": TRAIL_ARM_PCT,
-            "trail_pct": TRAIL_PCT,
-            "arm_price": (avg_price * (1.0 + TRAIL_ARM_PCT)) if avg_price else None,
+            "arm_pct": arm_pct,
+            "trail_pct": trail_pct,
+            "arm_price": (avg_price * (1.0 + arm_pct)) if avg_price else None,
             "peak": None,
         }
         _auto["trails"][symbol] = st
+    else:
+        # keep state but refresh config knobs if they changed
+        st["active"] = active
+        st["arm_pct"] = arm_pct
+        st["trail_pct"] = trail_pct
+        if avg_price and st.get("arm_price") is None:
+            st["arm_price"] = avg_price * (1.0 + arm_pct)
     return st
 
 def eval_trailing_and_maybe_sell(client, symbol: str, price: float, base_bal: float, flt):
@@ -629,12 +659,74 @@ def eval_trailing_and_maybe_sell(client, symbol: str, price: float, base_bal: fl
         _auto["err"] = str(e)
         return False
 
+def _trail_overrides_list_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    return jsonify(ok=True, overrides=_auto.get("overrides", {}))
+
+def _trail_overrides_upsert_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    data = request.get_json(silent=True) or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    if not sym:
+        return jsonify(ok=False, error="symbol required"), 400
+
+    # allowed keys
+    allowed = {
+        "trailing_active": lambda v: bool(v) if isinstance(v, bool) else str(v).lower() in ("1","true","yes","y","on"),
+        "trail_arm_pct": float,
+        "trail_pct": float,
+        "tpsl_active": lambda v: bool(v) if isinstance(v, bool) else str(v).lower() in ("1","true","yes","y","on"),
+        "tp_pct": float,
+        "sl_pct": float,
+    }
+
+    dest = _auto.setdefault("overrides", {}).setdefault(sym, {})
+    changed = {}
+    for k, coerce in allowed.items():
+        if k in data and data[k] is not None:
+            try:
+                dest[k] = coerce(data[k])
+                changed[k] = dest[k]
+            except Exception:
+                pass
+
+    # if we changed trailing knobs, refresh/arm state off current avg
+    try:
+        avg = get_open_long_avg_price(sym) or 0.0
+        ensure_trail_state(sym, float(avg))
+    except Exception:
+        pass
+
+    try:
+        app.logger.info("[TRAIL] overrides upsert for %s: %s", sym, changed)
+    except Exception:
+        pass
+
+    return jsonify(ok=True, symbol=sym, overrides=dest, changed=changed)
+
+def _trail_overrides_delete_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    data = request.get_json(silent=True) or {}
+    sym = (data.get("symbol") or "").upper().strip()
+    if not sym:
+        return jsonify(ok=False, error="symbol required"), 400
+    ovr = _auto.get("overrides", {})
+    removed = ovr.pop(sym, None)
+    # leaving trailing runtime state intact; optional: also clear it
+    # _auto.get("trails", {}).pop(sym, None)
+    return jsonify(ok=True, symbol=sym, removed=bool(removed), overrides=_auto.get("overrides", {}))
+
 # --- static TP/SL bands ---
 def eval_tpsl_and_maybe_sell(client, symbol: str, price: float, base_bal: float, flt):
     """
     Returns True if it executed a SELL due to TP/SL; False otherwise.
     """
-    if not ENABLE_TPSL:
+    # use per-symbol active/tp/sl
+    active, tp_pct_eff, sl_pct_eff = effective_tpsl(symbol, ENABLE_TPSL, TP_PCT, SL_PCT)
+    if not active:
         return False
     try:
         avg = get_open_long_avg_price(symbol)
@@ -646,8 +738,8 @@ def eval_tpsl_and_maybe_sell(client, symbol: str, price: float, base_bal: float,
         if notional < min_notional:
             return False
 
-        take = avg * (1.0 + TP_PCT)
-        stop = avg * (1.0 - SL_PCT)
+        take = avg * (1.0 + tp_pct_eff)
+        stop = avg * (1.0 - sl_pct_eff)
         reason = None
         if price >= take:
             reason = "tp"
@@ -1287,70 +1379,77 @@ def auto_loop():
                         app.logger.exception("[AUTO] %s BUY exception", sym)
                         log_decision(sym, p2, q2, rsi_now, "HOLD", "buy-exception")
 
-                # -------------------- SELL (step-safe quantity) -------------------
+                                # -------------------- SELL (step-safe quantity) -------------------
                 elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                     qty_str = qty_to_str(base_bal, step_str, min_qty_str)
                     if float(qty_str) * price >= min_notional and float(qty_str) > 0:
                         try:
-                            o = place_market_order(
-                            client, sym, "SELL",
-                            qty_str=qty_str,
-                            price_hint=price
-                        )
-                        record_trade_ts(sym)
+                            # market sell the step-safe quantity
+                            o = client.create_order(
+                                symbol=sym,
+                                side="SELL",
+                                type=Client.ORDER_TYPE_MARKET,
+                                quantity=qty_str,
+                                recvWindow=10000
+                            )
+                            record_trade_ts(sym)
 
-                        fills = o.get("fills") or []
-                        if fills:
-                            filled_qty = sum(float(f["qty"]) for f in fills)
-                            avg_price  = sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
-                        else:
-                             filled_qty = float(o.get("executedQty") or qty_str or 0.0)
-                             cq = float(o.get("cummulativeQuoteQty") or 0.0)
-                             avg_price = (cq / max(filled_qty, 1e-12)) if filled_qty > 0 else price
+                            # compute filled qty and avg price
+                            fills = o.get("fills") or []
+                            if fills:
+                                filled_qty = sum(float(f["qty"]) for f in fills)
+                                avg_price  = (
+                                    sum(float(f["price"]) * float(f["qty"]) for f in fills)
+                                    / max(filled_qty, 1e-12)
+                                )
+                            else:
+                                filled_qty = float(o.get("executedQty") or qty_str or 0.0)
+                                cq = float(o.get("cummulativeQuoteQty") or 0.0)
+                                avg_price = (cq / max(filled_qty, 1e-12)) if filled_qty > 0 else price
 
                             # persist trade row
-                        try:
-                            db.session.add(Trade(symbol=sym, side="SELL", amount=float(filled_qty),
-                                                 price=float(avg_price), timestamp=datetime.utcnow(),
-                                                 is_open=False, source="auto"))
-                            db.session.commit()
-                        except Exception:
-                            db.session.rollback()
+                            try:
+                                db.session.add(Trade(
+                                    symbol=sym, side="SELL", amount=float(filled_qty),
+                                    price=float(avg_price), timestamp=datetime.utcnow(),
+                                    is_open=False, source="auto"
+                                ))
+                                db.session.commit()
+                            except Exception:
+                                db.session.rollback()
 
-                        # attach to most recent open LONG, if it exists
-                        pos = None
-                        try:
-                            pos = Position.query.filter_by(symbol=sym, side="LONG", is_open=True) \
-                                                .order_by(Position.id.desc()).first()
+                            # attach to most recent open LONG, if it exists
+                            pos = None
+                            try:
+                                pos = (Position.query
+                                       .filter_by(symbol=sym, side="LONG", is_open=True)
+                                       .order_by(Position.id.desc())
+                                       .first())
                             except Exception:
                                 pos = None
 
-                            record_order_row(o, 'SELL', sym, float(filled_qty), float(avg_price),
-                                             position_id=(pos.id if pos else None))
+                            record_order_row(
+                                o, 'SELL', sym, float(filled_qty), float(avg_price),
+                                position_id=(pos.id if pos else None)
+                            )
                             close_position_if_filled_sells(sym)
 
-                            app.logger.info("[AUTO] SELL %s qty=%s @ %.4f | rsi=%.1f", sym, qty_str, avg_price, rsi_now)
+                            app.logger.info("[AUTO] SELL %s qty=%s @ %.4f | rsi=%.1f",
+                                            sym, qty_str, avg_price, rsi_now)
                             log_decision(sym, p2, q2, rsi_now, "SELL", "signal")
+
                         except BinanceAPIException as e:
                             _auto["err"] = str(e)
                             app.logger.warning("[AUTO] %s SELL error: %s", sym, e)
                             log_decision(sym, p2, q2, rsi_now, "HOLD", "api-error")
+
+                        except Exception as e:
+                            _auto["err"] = str(e)
+                            app.logger.exception("[AUTO] %s SELL exception", sym)
+                            log_decision(sym, p2, q2, rsi_now, "HOLD", "sell-exception")
+
                     else:
                         log_decision(sym, p2, q2, rsi_now, "HOLD", "qty-too-small")
-
-                else:
-                    log_decision(
-                        sym, p2, q2, rsi_now,
-                        "HOLD",
-                        "have-base" if (base_bal * price >= min_notional) else "no-cross"
-                    )
-
-            except BinanceAPIException as e:
-                _auto["err"] = str(e)
-                app.logger.warning("[AUTO] %s error: %s", sym, e)
-            except Exception as e:
-                _auto["err"] = str(e)
-                app.logger.exception("[AUTO] %s exception", sym)
 
             _auto["stop"].wait(30)
 
@@ -1674,6 +1773,9 @@ def _panic_clear_view():
 _register("/trail/enable",  "trail_enable_v2",  ["POST"], _trail_enable_view)
 _register("/trail/disable", "trail_disable_v2", ["POST"], _trail_disable_view)
 _register("/trail/status",  "trail_status_v2",  ["GET"],  _trail_status_view)
+_register("/trail/overrides", "trail_overrides_list_v2", ["GET"],  _trail_overrides_list_view)
+_register("/trail/upsert",    "trail_overrides_upsert_v2", ["POST"], _trail_overrides_upsert_view)
+_register("/trail/delete",    "trail_overrides_delete_v2", ["POST"], _trail_overrides_delete_view)
 
 _register("/panic/hedge",   "panic_hedge_v2",   ["POST"], _panic_hedge_view)
 _register("/panic/clear",   "panic_clear_v2",   ["POST"], _panic_clear_view)
@@ -1789,6 +1891,10 @@ def _auto_step_view():
                 elif base_bal * price >= min_notional:
                     reason = "have-base"
 
+            # effective knobs (for visibility only)
+            tpsl_active_eff, tp_eff, sl_eff = effective_tpsl(sym, ENABLE_TPSL, TP_PCT, SL_PCT)
+            trail_active_eff, trail_arm_eff, trail_pct_eff = effective_trailing(sym, ENABLE_TRAILING, TRAIL_ARM_PCT, TRAIL_PCT)
+
             items.append({
                 "symbol": sym,
                 "ef": round(p2, 6), "es": round(q2, 6),
@@ -1797,7 +1903,13 @@ def _auto_step_view():
                 "action": action, "reason": reason,
                 "ts": datetime.utcnow().isoformat(),
                 "window": "open" if win_open else "closed",
-                "spend_planned": round(spend_planned, 2) if spend_planned is not None else None
+                "spend_planned": round(spend_planned, 2) if ('spend_planned' in locals() and spend_planned is not None) else None,
+                "tpsl_active": bool(tpsl_active_eff),
+                "tp_pct": tp_eff,
+                "sl_pct": sl_eff,
+                "trailing_active": bool(trail_active_eff),
+                "trail_arm_pct": trail_arm_eff,
+                "trail_pct": trail_pct_eff,
             })
 
         except Exception as e:
