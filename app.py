@@ -435,6 +435,11 @@ LOSS_COOLDOWN_SEC  = int(os.getenv("LOSS_COOLDOWN_SEC", "900"))      # 15 minute
 # CSV of HH:MM-HH:MM windows; example: "00:00-23:59" (always on) or "12:00-16:00,20:00-22:00"
 TIME_WINDOWS_UTC = os.getenv("TIME_WINDOWS_UTC", "00:00-23:59")
 
+# --- execution mode & order safety ---
+DRY_RUN             = env_true("DRY_RUN", "false")           # simulate orders (no exchange hits)
+ORDER_RETRIES       = int(os.getenv("ORDER_RETRIES", "2"))   # extra tries on transient errors
+RETRY_BACKOFF_SEC   = float(os.getenv("RETRY_BACKOFF_SEC", "1.5"))
+
 # --- ensure DECISIONS exists (near the top, after deque import) ---
 try:
     DECISIONS
@@ -540,6 +545,14 @@ def schedule_allows_now_utc() -> bool:
             return True
     return False
 
+def is_rate_limit_err(e) -> bool:
+    s = str(e)
+    return ("-1003" in s) or ("Too much request weight" in s)
+
+def new_coid(prefix: str, sym: str) -> str:
+    # short, unique clientOrderId to dedup exchange retries
+    return f"{prefix}-{sym}-{int(time.time()*1000)%10_000_000_000}"
+    
 # --- trailing manager ---
 def ensure_trail_state(symbol: str, avg_price: float):
     st = _auto["trails"].get(symbol)
@@ -791,6 +804,56 @@ def atr_from_klines(klines, n):
 def is_rate_limit_err(e: Exception) -> bool:
     s = str(e)
     return ("-1003" in s) or ("Too much request weight" in s)
+
+def place_market_order(client, symbol: str, side: str, *,
+                       qty_str: str = None,
+                       quoteOrderQty: str = None,
+                       price_hint: float = None):
+    """
+    One place to send MARKET orders:
+    - DRY_RUN fabricates a fill with price_hint.
+    - Real mode retries on -1003 with small backoff.
+    - Always returns an object shaped like a Binance order.
+    """
+    assert side in ("BUY", "SELL")
+    if DRY_RUN:
+        now = int(time.time() * 1000)
+        if price_hint is None:
+            price_hint = float(client.get_symbol_ticker(symbol=symbol)["price"])
+        if side == "BUY":
+            # Prefer quoteOrderQty; fall back to qty
+            if quoteOrderQty:
+                qquote = float(quoteOrderQty)
+                filled_qty = qquote / max(price_hint, 1e-12)
+            else:
+                filled_qty = float(qty_str or "0")
+                qquote = filled_qty * price_hint
+        else:
+            filled_qty = float(qty_str or "0")
+            qquote = filled_qty * price_hint
+
+        o = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "status": "FILLED",
+            "transactTime": now,
+            "executedQty": f"{filled_qty:.10f}",
+            "cummulativeQuoteQty": f"{qquote:.10f}",
+            "fills": [{"price": f"{price_hint:.10f}", "qty": f"{filled_qty:.10f}"}],
+            "isDryRun": True,
+        }
+        if quoteOrderQty:
+            o["quoteOrderQty"] = quoteOrderQty
+        if qty_str:
+            o["origQty"] = qty_str
+        return o
+
+    # Real submission with retries
+    params = dict(
+        symbol=symbol,
+        side=side,
+        type=Client.ORDER
 
 # --- indicators ---
 def ema(series, n):
@@ -1179,19 +1242,23 @@ def auto_loop():
                     log_decision(sym, p2, q2, rsi_now, "HOLD", "window-closed")
                 
                     try:
-                        o = client.create_order(
-                            symbol=sym,
-                            side="BUY",
-                            type=Client.ORDER_TYPE_MARKET,
+                        o = place_market_order(
+                            client, sym, "BUY",
                             quoteOrderQty=f"{spend:.2f}",
-                            recvWindow=10000
+                            price_hint=price
                         )
                         record_trade_ts(sym)
+
+                        # parse fills
                         fills = o.get("fills") or []
-                        filled_qty = sum(float(f["qty"]) for f in fills) if fills else float(o.get("executedQty") or 0.0)
-                        avg_price = (
-                            sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
-                        ) if fills else price
+                        if fills:
+                            filled_qty = sum(float(f["qty"]) for f in fills)
+                            avg_price  = sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
+                        else:
+                             # fallback if no fills array (shouldn't happen, but safe)
+                             filled_qty = float(o.get("executedQty") or 0.0)
+                             cq = float(o.get("cummulativeQuoteQty") or 0.0)
+                             avg_price = (cq / max(filled_qty, 1e-12)) if filled_qty > 0 else price
 
                         try:
                             db.session.add(Trade(symbol=sym, side="BUY", amount=float(filled_qty),
@@ -1219,19 +1286,22 @@ def auto_loop():
                     qty_str = qty_to_str(base_bal, step_str, min_qty_str)
                     if float(qty_str) * price >= min_notional and float(qty_str) > 0:
                         try:
-                            o = client.create_order(
-                                symbol=sym,
-                                side="SELL",
-                                type=Client.ORDER_TYPE_MARKET,
-                                quantity=qty_str,
-                                recvWindow=10000
-                            )
-                            record_trade_ts(sym)
-                            fills = o.get("fills") or []
-                            filled_qty = sum(float(f["qty"]) for f in fills) if fills else float(o.get("executedQty") or 0.0)
-                            avg_price = (
-                                sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
-                            ) if fills else price
+                            # place order (dry-run or real)
+                            o = place_market_order(
+                            client, sym, "SELL",
+                            qty_str=qty_str,
+                            price_hint=price
+                        )
+                        record_trade_ts(sym)
+
+                        fills = o.get("fills") or []
+                        if fills:
+                            filled_qty = sum(float(f["qty"]) for f in fills)
+                            avg_price  = sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
+                        else:
+                             filled_qty = float(o.get("executedQty") or qty_str or 0.0)
+                             cq = float(o.get("cummulativeQuoteQty") or 0.0)
+                             avg_price = (cq / max(filled_qty, 1e-12)) if filled_qty > 0 else price
 
                             # persist trade row
                             try:
@@ -1513,6 +1583,22 @@ def _auto_health_view():
 
 _register("/auto/health", "auto_health_v2", ["GET"], _auto_health_view)
 
+def _auto_mode_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    if request.method == "GET":
+        return jsonify(ok=True, dry_run=bool(globals().get("DRY_RUN", False)))
+    data = request.get_json(silent=True) or {}
+    val = data.get("dry_run")
+    globals()["DRY_RUN"] = _coerce_bool(val)
+    try:
+        app.logger.info("[AUTO] DRY_RUN set to %s", DRY_RUN)
+    except Exception:
+        pass
+    return jsonify(ok=True, dry_run=DRY_RUN)
+
+_register("/auto/mode", "auto_mode", ["GET","POST"], _auto_mode_view)
+
 # --- trailing control routes ---
 def _trail_enable_view():
     if not require_admin():
@@ -1734,14 +1820,15 @@ def _debug_live_buy_view():
 
         qty_str = qty_to_str(spend/price, step_str, min_qty_str)
 
+        # try order, respecting DRY_RUN and quote fallback
         try:
-            o = c.create_order(symbol=sym, side="BUY", type="MARKET", quantity=qty_str)
+            # first attempt: exact quantity
+            o = place_market_order(c, sym, "BUY", qty_str=qty_str, price_hint=price)
         except BinanceAPIException as e:
             if ("-1013" in str(e)) or ("LOT_SIZE" in str(e)) or ("Illegal characters" in str(e)):
-                o = c.create_order(symbol=sym, side="BUY", type="MARKET",
-                                   quoteOrderQty=f"{spend:.2f}")
-            else:
-                return jsonify(ok=False, error=str(e)), 400
+                o = place_market_order(c, sym, "BUY", quoteOrderQty=f"{spend:.2f}", price_hint=price)
+        else:
+             return jsonify(ok=False, error=str(e)), 400
 
         return jsonify(ok=True,
                        status=o.get("status"),
