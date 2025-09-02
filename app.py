@@ -1286,7 +1286,6 @@ def auto_loop():
                     qty_str = qty_to_str(base_bal, step_str, min_qty_str)
                     if float(qty_str) * price >= min_notional and float(qty_str) > 0:
                         try:
-                            # place order (dry-run or real)
                             o = place_market_order(
                             client, sym, "SELL",
                             qty_str=qty_str,
@@ -1304,19 +1303,19 @@ def auto_loop():
                              avg_price = (cq / max(filled_qty, 1e-12)) if filled_qty > 0 else price
 
                             # persist trade row
-                            try:
-                                db.session.add(Trade(symbol=sym, side="SELL", amount=float(filled_qty),
-                                                     price=float(avg_price), timestamp=datetime.utcnow(),
-                                                     is_open=False, source="auto"))
-                                db.session.commit()
-                            except Exception:
-                                db.session.rollback()
+                        try:
+                            db.session.add(Trade(symbol=sym, side="SELL", amount=float(filled_qty),
+                                                 price=float(avg_price), timestamp=datetime.utcnow(),
+                                                 is_open=False, source="auto"))
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
 
-                            # attach to most recent open LONG, if it exists
-                            pos = None
-                            try:
-                                pos = Position.query.filter_by(symbol=sym, side="LONG", is_open=True) \
-                                                     .order_by(Position.id.desc()).first()
+                        # attach to most recent open LONG, if it exists
+                        pos = None
+                        try:
+                            pos = Position.query.filter_by(symbol=sym, side="LONG", is_open=True) \
+                                                .order_by(Position.id.desc()).first()
                             except Exception:
                                 pos = None
 
