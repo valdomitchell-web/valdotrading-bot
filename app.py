@@ -1602,8 +1602,7 @@ def _auto_step_view():
     allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
     win_open = schedule_allows_now_utc()
-    "window":"open" 
-    if win_open else "closed"
+    #"window":"open" if win_open else "closed"
 
     for sym in AUTO_SYMBOLS:
         try:
