@@ -1712,7 +1712,8 @@ def _auto_step_view():
         except Exception as e:
             items.append({"symbol": sym, "error": str(e)})
 
-    return jsonify(ok=True, items=items))
+    return jsonify(ok=True, items=items)
+)
 
 def _debug_live_buy_view():
     if not require_admin():
