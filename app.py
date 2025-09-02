@@ -1604,12 +1604,12 @@ def _auto_step_view():
     allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
     allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
-    # safe defaults if these globals don’t exist
+    # safe defaults if not defined
     ATR_LEN_SAFE     = int(globals().get("ATR_LEN", 14))
     ATR_MIN_PCT_SAFE = float(globals().get("ATR_MIN_PCT", 0.15))
     ATR_MAX_PCT_SAFE = float(globals().get("ATR_MAX_PCT", 2.5))
 
-    # kline limit large enough for all indicators
+    # enough candles for all indicators
     kl_needed = max(EMA_SLOW, RSI_LEN, ATR_LEN_SAFE) + 2
     kl_limit = max(kl_needed, 60)
 
@@ -1658,11 +1658,10 @@ def _auto_step_view():
             symbol_notional = base_bal * price
             under_cap = (symbol_notional < PER_SYMBOL_MAX_USDT)
 
-            # kline window open?
+            # is the latest kline still open?
             win_open = False
             try:
-                last_k = kl[-1]
-                k_close_ms = int(last_k[6]) if len(last_k) > 6 else None
+                k_close_ms = int(kl[-1][6]) if len(kl[-1]) > 6 else None
                 now_ms = int(time.time() * 1000)
                 win_open = (k_close_ms is not None) and (now_ms < k_close_ms)
             except Exception:
@@ -1713,7 +1712,7 @@ def _auto_step_view():
         except Exception as e:
             items.append({"symbol": sym, "error": str(e)})
 
-    return jsonify(ok=True, items=items)
+    return jsonify(ok=True, items=items))
 
 def _debug_live_buy_view():
     if not require_admin():
