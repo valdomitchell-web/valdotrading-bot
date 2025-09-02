@@ -1590,8 +1590,11 @@ _register("/panic/clear",   "panic_clear_v2",   ["POST"], _panic_clear_view)
 def _auto_step_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
+
     client = make_client()
     items = []
+
+    # balances
     try:
         acct = client.get_account()
         bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
@@ -1601,25 +1604,28 @@ def _auto_step_view():
     allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
     allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
-    win_open = schedule_allows_now_utc()
+    # safe defaults if these globals don’t exist
+    ATR_LEN_SAFE     = int(globals().get("ATR_LEN", 14))
+    ATR_MIN_PCT_SAFE = float(globals().get("ATR_MIN_PCT", 0.15))
+    ATR_MAX_PCT_SAFE = float(globals().get("ATR_MAX_PCT", 2.5))
+
+    # kline limit large enough for all indicators
+    kl_needed = max(EMA_SLOW, RSI_LEN, ATR_LEN_SAFE) + 2
+    kl_limit = max(kl_needed, 60)
 
     for sym in AUTO_SYMBOLS:
-                # fetch klines with soft -1003 handling
         try:
-            kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
-        except BinanceAPIException as e:
-            msg = str(e)
-            if "-1003" in msg:
-                items.append({"symbol": sym, "error": "rate-limit-1003", "hint": "backoff"})
-            else:
-                items.append({"symbol": sym, "error": msg})
-            continue
+            # ---- data fetch ----
+            kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=kl_limit)
+            if not kl:
+                items.append({"symbol": sym, "error": "no klines"})
+                continue
 
-        if not kl:
-            items.append({"symbol": sym, "error": "no klines"})
-            continue
+            closes = [float(k[4]) for k in kl]
+            ef = ema(closes, EMA_FAST)
+            es = ema(closes, EMA_SLOW)
+            r  = rsi(closes, RSI_LEN)
 
-            closes, ef, es, r = last_close_and_indicators(kl)
             p1, p2 = ef[-2], ef[-1]
             q1, q2 = es[-2], es[-1]
             rsi_now = r[-1] if r[-1] is not None else 50.0
@@ -1632,52 +1638,44 @@ def _auto_step_view():
             bull_x = bull_cross or (allow_entry and trend_up)
             bear_x = bear_cross or (allow_exit  and trend_dn)
 
-            price = float(closes[-1])  # reuse last close; fewer requests
+            price = float(closes[-1])  # reuse last close; avoids extra ticker call
             base = sym.replace("USDT", "")
             base_bal = bals.get(base, 0.0)
-            _, _, min_notional = symbol_filters(client, sym)
 
             # ATR %
-            atr_val = atr_from_klines(kl, ATR_LEN)
+            try:
+                atr_val = atr_from_klines(kl, ATR_LEN_SAFE)
+            except Exception:
+                atr_val = None
             atr_pct = (atr_val / price * 100.0) if (atr_val is not None and price > 0) else None
 
-           
-            # --- churn guards ---
+            step_str, min_qty_str, min_notional = symbol_filters(client, sym)
+
+            # helpers
             sep_bps = ema_sep_bps(p2, q2)
             buy_ok  = bull_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "BUY")  and (sep_bps >= EMA_SEP_BPS)
             sell_ok = bear_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "SELL") and (sep_bps >= EMA_SEP_BPS)
-
-            # --- exposure guards ---
-            # cap per-symbol notional before adding more (prevents repeated DCA into chop)
             symbol_notional = base_bal * price
             under_cap = (symbol_notional < PER_SYMBOL_MAX_USDT)
 
-            # --- burst throttle (per-minute) ---
-            now_min = int(time.time() // 60)
-            mb = _auto.get("minute_buys")
-            if not isinstance(mb, dict) or mb.get("when") != now_min:
-                _auto["minute_buys"] = {"when": now_min, "count": 0}
-            can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
-
-                        # -------- Volatility gate + preview sizing (no side-effects) --------
-            action = "HOLD"
-            reason = "no-cross"
-
-            # Is the last kline still open? (helps you read the decisions)
+            # kline window open?
             win_open = False
             try:
                 last_k = kl[-1]
-                k_close_ms = int(last_k[6]) if len(last_k) > 6 else None  # kline close time (ms)
+                k_close_ms = int(last_k[6]) if len(last_k) > 6 else None
                 now_ms = int(time.time() * 1000)
                 win_open = (k_close_ms is not None) and (now_ms < k_close_ms)
             except Exception:
                 pass
 
-            spend_planned = None  # previewed spend for BUY candidates (dynamic sizing)
+            # ---- decide (preview only; no side-effects) ----
+            action = "HOLD"
+            reason = "no-cross"
+            spend_planned = None
 
-            if atr_pct is not None and atr_pct < ATR_MIN_PCT:
+            if atr_pct is not None and atr_pct < ATR_MIN_PCT_SAFE:
                 reason = "low-vol"
-            elif atr_pct is not None and atr_pct > ATR_MAX_PCT:
+            elif atr_pct is not None and atr_pct > ATR_MAX_PCT_SAFE:
                 reason = "high-vol"
             else:
                 if (
@@ -1685,14 +1683,17 @@ def _auto_step_view():
                     and rsi_now <= BUY_RSI_MAX
                     and base_bal * price < min_notional
                     and under_cap
-                    and can_add_buy
                 ):
                     action, reason = "BUY", "signal"
-                    # preview (do not mutate minute_buys in /auto/step)
+                    # preview dynamic spend
                     try:
-                        spend_planned = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
+                        spend_dyn = dynamic_spend_for_atr(atr_pct)
                     except Exception:
-                        spend_planned = max(float(AUTO_RISK_USDT), float(min_notional))
+                        spend_dyn = float(AUTO_RISK_USDT)
+                    try:
+                        spend_planned = max(float(spend_dyn), float(min_notional))
+                    except Exception:
+                        spend_planned = float(min_notional)
                 elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                     action, reason = "SELL", "signal"
                 elif base_bal * price >= min_notional:
@@ -1708,8 +1709,10 @@ def _auto_step_view():
                 "window": "open" if win_open else "closed",
                 "spend_planned": round(spend_planned, 2) if spend_planned is not None else None
             })
-    except Exception as e:
+
+        except Exception as e:
             items.append({"symbol": sym, "error": str(e)})
+
     return jsonify(ok=True, items=items)
 
 def _debug_live_buy_view():
