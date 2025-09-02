@@ -1369,9 +1369,6 @@ def _auto_config_view():
     float_keys += ["PORTFOLIO_MAX_USDT"]
     str_keys += ["TIME_WINDOWS_UTC"]
     int_keys   += ["MAX_LOSS_STREAK","LOSS_COOLDOWN_SEC"]
-    
-    if "TIME_WINDOWS_UTC" in data:
-    globals()["_SCHED_WINS"] = _parse_windows(TIME_WINDOWS_UTC) 
 
     updated = {}
 
@@ -1397,7 +1394,9 @@ def _auto_config_view():
         if k in data:
             globals()[k] = str(data[k])
             updated[k] = globals()[k]
-
+    if "TIME_WINDOWS_UTC" in data:
+    globals()["_SCHED_WINS"] = _parse_windows(TIME_WINDOWS_UTC)
+    
     # Special cases
     if "AUTO_SYMBOLS" in data and isinstance(data["AUTO_SYMBOLS"], (list, str)):
         if isinstance(data["AUTO_SYMBOLS"], list):
