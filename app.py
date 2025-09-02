@@ -854,7 +854,7 @@ def place_market_order(client, symbol: str, side: str, *,
         symbol=symbol,
         side=side,
         type=Client.ORDER
-
+        )
 # --- indicators ---
 def ema(series, n):
     k = 2/(n+1)
