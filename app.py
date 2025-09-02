@@ -1224,62 +1224,68 @@ def auto_loop():
                 
                 if (
                     _auto["enabled"]
-                    and (not _auto.get("panic_armed", False))
-                    and (not cooldown_active)
+                    and not _auto.get("panic_armed", False)
                     and buy_ok
                     and rsi_now <= BUY_RSI_MAX
                     and base_bal * price < min_notional
                     and under_cap
-                    and cap_ok
                     and can_add_buy
                 ):
-                    # ... (BUY execution body unchanged) ...
-                    # after successful BUY, reflect the spend in portfolio_notional for subsequent symbols
-                    portfolio_notional += spend
-                elif (
-                    _auto["enabled"] and buy_ok and not window_ok
-                ):
-                    log_decision(sym, p2, q2, rsi_now, "HOLD", "window-closed")
-                
+                    spend = max(AUTO_RISK_USDT, min_notional)  # satisfy exchange min notional
                     try:
-                        o = place_market_order(
-                            client, sym, "BUY",
+                        o = client.create_order(
+                            symbol=sym,
+                            side="BUY",
+                            type=Client.ORDER_TYPE_MARKET,
                             quoteOrderQty=f"{spend:.2f}",
-                            price_hint=price
+                            recvWindow=10000
                         )
+
                         record_trade_ts(sym)
 
-                        # parse fills
                         fills = o.get("fills") or []
-                        if fills:
-                            filled_qty = sum(float(f["qty"]) for f in fills)
-                            avg_price  = sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
-                        else:
-                             # fallback if no fills array (shouldn't happen, but safe)
-                             filled_qty = float(o.get("executedQty") or 0.0)
-                             cq = float(o.get("cummulativeQuoteQty") or 0.0)
-                             avg_price = (cq / max(filled_qty, 1e-12)) if filled_qty > 0 else price
+                        filled_qty = (
+                            sum(float(f["qty"]) for f in fills)
+                            if fills else float(o.get("executedQty") or 0.0)
+                        )
+                        avg_price = (
+                            sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
+                        ) if fills else price
 
+                        # persist trade row
                         try:
-                            db.session.add(Trade(symbol=sym, side="BUY", amount=float(filled_qty),
-                                                 price=float(avg_price), timestamp=datetime.utcnow(),
-                                                 is_open=False, source="auto"))
+                            db.session.add(Trade(
+                                symbol=sym, side="BUY", amount=float(filled_qty),
+                                price=float(avg_price), timestamp=datetime.utcnow(),
+                                is_open=False, source="auto"
+                            ))
                             db.session.commit()
                         except Exception:
                             db.session.rollback()
 
+                        # ensure a DB position exists/updates avg price
                         pos = ensure_position_on_buy(sym, filled_qty, avg_price)
-                        record_order_row(o, 'BUY', sym, float(filled_qty), float(avg_price),
-                                         position_id=(pos.id if pos else None))
+
+                        # record order locally for the dashboard
+                        record_order_row(
+                            o, 'BUY', sym, float(filled_qty), float(avg_price),
+                            position_id=(pos.id if pos else None)
+                        )
 
                         _auto["minute_buys"]["count"] += 1
-                        app.logger.info("[AUTO] BUY %s qty=%.8f @ %.4f | rsi=%.1f", sym, filled_qty, avg_price, rsi_now)
+                        app.logger.info("[AUTO] BUY %s qty=%.8f @ %.4f | rsi=%.1f",
+                                        sym, filled_qty, avg_price, rsi_now)
                         log_decision(sym, p2, q2, rsi_now, "BUY", "signal")
 
                     except BinanceAPIException as e:
                         _auto["err"] = str(e)
                         app.logger.warning("[AUTO] %s BUY error: %s", sym, e)
                         log_decision(sym, p2, q2, rsi_now, "HOLD", "api-error")
+
+                    except Exception as e:
+                        _auto["err"] = str(e)
+                        app.logger.exception("[AUTO] %s BUY exception", sym)
+                        log_decision(sym, p2, q2, rsi_now, "HOLD", "buy-exception")
 
                 # -------------------- SELL (step-safe quantity) -------------------
                 elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
