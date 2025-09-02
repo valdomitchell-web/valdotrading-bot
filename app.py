@@ -1602,18 +1602,22 @@ def _auto_step_view():
     allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
 
     win_open = schedule_allows_now_utc()
-    #"window":"open" if win_open else "closed"
 
     for sym in AUTO_SYMBOLS:
+                # fetch klines with soft -1003 handling
         try:
             kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=120)
-    except BinanceAPIException as e:
-        msg = str(e)
-        if "-1003" in msg:
-            items.append({"symbol": sym, "error": "rate-limit-1003", "hint": "backoff"})
+        except BinanceAPIException as e:
+            msg = str(e)
+            if "-1003" in msg:
+                items.append({"symbol": sym, "error": "rate-limit-1003", "hint": "backoff"})
+            else:
+                items.append({"symbol": sym, "error": msg})
             continue
-        items.append({"symbol": sym, "error": msg})
-        continue
+
+        if not kl:
+            items.append({"symbol": sym, "error": "no klines"})
+            continue
 
             closes, ef, es, r = last_close_and_indicators(kl)
             p1, p2 = ef[-2], ef[-1]
@@ -1686,6 +1690,7 @@ def _auto_step_view():
                 "atr_pct": round(atr_pct, 2) if atr_pct is not None else None,
                 "action": action, "reason": reason,
                 "ts": datetime.utcnow().isoformat()
+                "window":"open" if win_open else "closed"
             })
 
         except Exception as e:
