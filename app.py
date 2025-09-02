@@ -1689,7 +1689,7 @@ def _auto_step_view():
                 "rsi": round(rsi_now, 2),
                 "atr_pct": round(atr_pct, 2) if atr_pct is not None else None,
                 "action": action, "reason": reason,
-                "ts": datetime.utcnow().isoformat()
+                "ts": datetime.utcnow().isoformat(),
                 "window":"open" if win_open else "closed"
             })
 
