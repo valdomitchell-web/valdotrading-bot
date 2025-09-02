@@ -1708,10 +1708,8 @@ def _auto_step_view():
                 "window": "open" if win_open else "closed",
                 "spend_planned": round(spend_planned, 2) if spend_planned is not None else None
             })
-
-        except Exception as e:
+    except Exception as e:
             items.append({"symbol": sym, "error": str(e)})
-
     return jsonify(ok=True, items=items)
 
 def _debug_live_buy_view():
