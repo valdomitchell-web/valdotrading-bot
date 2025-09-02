@@ -1713,8 +1713,7 @@ def _auto_step_view():
             items.append({"symbol": sym, "error": str(e)})
 
     return jsonify(ok=True, items=items)
-)
-
+    #)
 def _debug_live_buy_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
