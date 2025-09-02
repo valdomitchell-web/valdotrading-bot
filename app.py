@@ -1659,29 +1659,44 @@ def _auto_step_view():
                 _auto["minute_buys"] = {"when": now_min, "count": 0}
             can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
 
+                        # -------- Volatility gate + preview sizing (no side-effects) --------
             action = "HOLD"
             reason = "no-cross"
 
-            # Volatility gate first
+            # Is the last kline still open? (helps you read the decisions)
+            win_open = False
+            try:
+                last_k = kl[-1]
+                k_close_ms = int(last_k[6]) if len(last_k) > 6 else None  # kline close time (ms)
+                now_ms = int(time.time() * 1000)
+                win_open = (k_close_ms is not None) and (now_ms < k_close_ms)
+            except Exception:
+                pass
+
+            spend_planned = None  # previewed spend for BUY candidates (dynamic sizing)
+
             if atr_pct is not None and atr_pct < ATR_MIN_PCT:
                 reason = "low-vol"
             elif atr_pct is not None and atr_pct > ATR_MAX_PCT:
                 reason = "high-vol"
             else:
-                if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
+                if (
+                    buy_ok
+                    and rsi_now <= BUY_RSI_MAX
+                    and base_bal * price < min_notional
+                    and under_cap
+                    and can_add_buy
+                ):
                     action, reason = "BUY", "signal"
-                    _auto["minute_buys"]["count"] += 1  # increment only if we'd actually BUY
+                    # preview (do not mutate minute_buys in /auto/step)
+                    try:
+                        spend_planned = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
+                    except Exception:
+                        spend_planned = max(float(AUTO_RISK_USDT), float(min_notional))
                 elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                     action, reason = "SELL", "signal"
                 elif base_bal * price >= min_notional:
                     reason = "have-base"
-
-                spend_planned = None
-                cap_reason = None
-                if buy_ok and rsi_now <= BUY_RSI_MAX and base_bal * price < min_notional and under_cap and can_add_buy:
-                    spend_planned = max(dynamic_spend_for_atr(atr_pct), float(min_notional))
-                    # approximate portfolio cap using per-symbol notional (best-effort)
-                    # (You can make this exact by tracking a local `portfolio_notional` like the main loop.)
 
             items.append({
                 "symbol": sym,
@@ -1690,7 +1705,8 @@ def _auto_step_view():
                 "atr_pct": round(atr_pct, 2) if atr_pct is not None else None,
                 "action": action, "reason": reason,
                 "ts": datetime.utcnow().isoformat(),
-                "window":"open" if win_open else "closed"
+                "window": "open" if win_open else "closed",
+                "spend_planned": round(spend_planned, 2) if spend_planned is not None else None
             })
 
         except Exception as e:
