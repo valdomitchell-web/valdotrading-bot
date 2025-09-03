@@ -351,10 +351,6 @@ try:
 except Exception:
     ThreadedWebsocketManager = None  # library not available -> auto fallback to REST
 
-WS_KLINES_ENABLED = env_true("WS_KLINES_ENABLED", "true")   # turn on the shared kline stream
-WS_STALE_SEC      = int(os.getenv("WS_STALE_SEC", "12"))    # how old can the last tick be
-WS_KLINE_LIMIT    = int(os.getenv("WS_KLINE_LIMIT", "240")) # bars to keep per symbol
-
 USE_US      = env_true("BINANCE_US", "false")
 TESTNET     = env_true("BINANCE_TESTNET", "false")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # set this in Render dashboard
@@ -450,18 +446,77 @@ DRY_RUN             = env_true("DRY_RUN", "false")           # simulate orders (
 ORDER_RETRIES       = int(os.getenv("ORDER_RETRIES", "2"))   # extra tries on transient errors
 RETRY_BACKOFF_SEC   = float(os.getenv("RETRY_BACKOFF_SEC", "1.5"))
 
+# --- WS knobs & state ---
+WS_KLINES_ENABLED = env_true("WS_KLINES_ENABLED", "true")
+WS_STALE_SEC      = int(os.getenv("WS_STALE_SEC", "60"))
+WS_KLINE_LIMIT    = int(os.getenv("WS_KLINE_LIMIT", "240"))
+
+# central WS state
+_ws = {
+    "twm": None,
+    "running": False,
+    "err": None,
+    "streams": {},          # key = f"{symbol}:{interval}" -> deque of REST-shaped klines
+    "last": {},             # key -> last closed kline closeTime (ms)
+    "start_attempted": False,
+}
 # ============ WebSocket kline cache/manager ============
 import threading
 from collections import deque
 
-_ws = {
-    "twm": None,
-    "lock": threading.RLock(),
-    "cache": {},         # key: "SYMBOL:INTERVAL" -> deque(list-like REST kline rows)
-    "last_update": {},   # key: "SYMBOL:INTERVAL" -> time.time() of last event
-    "running": False,
-    "err": None,
-}
+try:
+    from binance.streams import ThreadedWebsocketManager
+except Exception:
+    ThreadedWebsocketManager = None
+
+def _ws_key(symbol, interval):
+    return f"{symbol}:{interval}"
+
+def _ensure_stream(symbol, interval):
+    key = _ws_key(symbol, interval)
+    if key not in _ws["streams"]:
+        _ws["streams"][key] = deque(maxlen=max(WS_KLINE_LIMIT, 1))
+    return _ws["streams"][key]
+
+def _on_kline(msg):
+    # Called by python-binance TWM
+    try:
+        if not msg or msg.get("e") != "kline":
+            return
+        k = msg.get("k") or {}
+        sym = (msg.get("s") or "").upper()
+        interval = k.get("i") or AUTO_INTERVAL
+        key = _ws_key(sym, interval)
+
+        # Build REST-shaped kline row (match /api/v3/klines)
+        # [ openTime, open, high, low, close, volume, closeTime, qav, trades, takerBase, takerQuote, ignore ]
+        row = [
+            int(k.get("t") or 0),
+            float(k.get("o") or 0.0),
+            float(k.get("h") or 0.0),
+            float(k.get("l") or 0.0),
+            float(k.get("c") or 0.0),
+            float(k.get("v") or 0.0),
+            int(k.get("T") or 0),
+            float(k.get("q") or 0.0),
+            int(k.get("n") or 0),
+            float(k.get("V") or 0.0),
+            float(k.get("Q") or 0.0),
+            0
+        ]
+
+        buf = _ensure_stream(sym, interval)
+        # Replace last if same openTime, else append
+        if buf and buf[-1][0] == row[0]:
+            buf[-1] = row
+        else:
+            buf.append(row)
+
+        # Update last closed bar time (when x==True)
+        if k.get("x"):
+            _ws["last"][key] = row[6]
+    except Exception as ex:
+        _ws["err"] = f"on_kline: {ex}"
 
 def _ws_on_kline(msg):
     """Binance WS callback; normalizes to REST-like kline rows."""
@@ -495,53 +550,59 @@ def _ws_on_kline(msg):
         _ws["err"] = str(ex)
 
 def ws_start_kline_stream(symbols=None, interval=None):
-    """Start the shared kline stream once; safe to call multiple times."""
+    """
+    Start a spot kline WS for the given symbols+interval.
+    Returns True on success, False otherwise (and sets _ws['err']).
+    """
     if not WS_KLINES_ENABLED:
+        _ws["err"] = "ws disabled"
         return False
     if ThreadedWebsocketManager is None:
-        _ws["err"] = "websocket-manager-unavailable"
+        _ws["err"] = "python-binance missing (ThreadedWebsocketManager)"
         return False
-    if _ws["running"]:
+
+    if _ws.get("running"):
         return True
-    syms = (symbols or AUTO_SYMBOLS)[:]
+
+    syms = [s for s in (symbols or AUTO_SYMBOLS) if s and s.endswith("USDT")]
     itv  = interval or AUTO_INTERVAL
+
     try:
+        # Create TWM with same creds/tld/testnet as your REST client
+        c = make_client()
+        tld = "us" if USE_US else "com"
         twm = ThreadedWebsocketManager(
             api_key=os.getenv("BINANCE_API_KEY"),
             api_secret=os.getenv("BINANCE_API_SECRET"),
-            tld=("us" if USE_US else "com"),
+            tld=tld,
             testnet=TESTNET,
         )
         twm.start()
         for s in syms:
-            # kline stream for each symbol at AUTO_INTERVAL
-            twm.start_kline_socket(callback=_ws_on_kline, symbol=s.lower(), interval=itv)
+            twm.start_kline_socket(callback=_on_kline, symbol=s, interval=itv)
+
         _ws["twm"] = twm
         _ws["running"] = True
+        _ws["err"] = None
+        _ws["start_attempted"] = True
+        # precreate buffers so /ws/status shows keys immediately
+        for s in syms:
+            _ensure_stream(s, itv)
         return True
     except Exception as ex:
         _ws["err"] = str(ex)
-        try:
-            if "twm" in locals():
-                twm.stop()
-        except Exception:
-            pass
         _ws["running"] = False
+        _ws["twm"] = None
         return False
-
 def get_klines_cached(symbol, interval, limit):
-    """Return recent klines from cache if fresh & sufficient; else None."""
-    key = f"{symbol}:{interval}"
-    with _ws["lock"]:
-        dq = _ws["cache"].get(key)
-        last = _ws["last_update"].get(key)
-        if dq is None or last is None:
-            return None
-        if (time.time() - last) > WS_STALE_SEC:
-            return None
-        if len(dq) < limit:
-            return None
-        return list(dq)[-limit:]
+    """Return up to `limit` klines from WS cache in REST shape; None if empty."""
+    key = _ws_key(symbol, interval)
+    buf = _ws["streams"].get(key)
+    if not buf:
+        return None
+    if limit is None or limit <= 0:
+        return list(buf)
+    return list(buf)[-limit:]
 
 def get_klines_any(client, symbol, interval, limit):
     """Prefer WS cache; start it lazily if enabled, else fall back to REST."""
@@ -1825,20 +1886,11 @@ def _auto_mode_view():
 
 _register("/auto/mode", "auto_mode", ["GET","POST"], _auto_mode_view)
 
-def _ws_status_view():
+def _ws_start_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-    with _ws["lock"]:
-        now = time.time()
-        status = {}
-        for s in AUTO_SYMBOLS:
-            key = f"{s}:{AUTO_INTERVAL}"
-            age = None
-            if key in _ws["last_update"]:
-                age = round(now - _ws["last_update"][key], 2)
-            bars = len(_ws["cache"].get(key, []))
-            status[key] = {"bars": bars, "last_age_sec": age}
-    return jsonify(ok=True, running=_ws["running"], err=_ws["err"], status=status)
+    ok = ws_start_kline_stream(AUTO_SYMBOLS, AUTO_INTERVAL)
+    return jsonify(ok=bool(ok), running=_ws.get("running"), err=_ws.get("err"))
 
 _register("/ws/status", "ws_status", ["GET"], _ws_status_view)
 
