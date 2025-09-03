@@ -345,6 +345,16 @@ from binance.exceptions import BinanceAPIException
 def env_true(name, default="false"):
     return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
 
+# --- optional WebSocket klines (to avoid -1003) ---
+try:
+    from binance import ThreadedWebsocketManager
+except Exception:
+    ThreadedWebsocketManager = None  # library not available -> auto fallback to REST
+
+WS_KLINES_ENABLED = env_true("WS_KLINES_ENABLED", "true")   # turn on the shared kline stream
+WS_STALE_SEC      = int(os.getenv("WS_STALE_SEC", "12"))    # how old can the last tick be
+WS_KLINE_LIMIT    = int(os.getenv("WS_KLINE_LIMIT", "240")) # bars to keep per symbol
+
 USE_US      = env_true("BINANCE_US", "false")
 TESTNET     = env_true("BINANCE_TESTNET", "false")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # set this in Render dashboard
@@ -439,6 +449,110 @@ TIME_WINDOWS_UTC = os.getenv("TIME_WINDOWS_UTC", "00:00-23:59")
 DRY_RUN             = env_true("DRY_RUN", "false")           # simulate orders (no exchange hits)
 ORDER_RETRIES       = int(os.getenv("ORDER_RETRIES", "2"))   # extra tries on transient errors
 RETRY_BACKOFF_SEC   = float(os.getenv("RETRY_BACKOFF_SEC", "1.5"))
+
+# ============ WebSocket kline cache/manager ============
+import threading
+from collections import deque
+
+_ws = {
+    "twm": None,
+    "lock": threading.RLock(),
+    "cache": {},         # key: "SYMBOL:INTERVAL" -> deque(list-like REST kline rows)
+    "last_update": {},   # key: "SYMBOL:INTERVAL" -> time.time() of last event
+    "running": False,
+    "err": None,
+}
+
+def _ws_on_kline(msg):
+    """Binance WS callback; normalizes to REST-like kline rows."""
+    try:
+        if not msg or msg.get("e") != "kline":
+            return
+        s = (msg.get("s") or "").upper()
+        k = msg.get("k") or {}
+        interval = k.get("i")
+        t_open  = int(k.get("t") or 0)
+        t_close = int(k.get("T") or 0)
+        o = str(k.get("o") or "0")
+        h = str(k.get("h") or "0")
+        l = str(k.get("l") or "0")
+        c = str(k.get("c") or "0")
+        # Build a REST-like row (we only consume OHLC + times)
+        row = [t_open, o, h, l, c, "0", "0", t_close, "0", "0", "0", "0"]
+
+        key = f"{s}:{interval}"
+        with _ws["lock"]:
+            dq = _ws["cache"].get(key)
+            if dq is None:
+                dq = deque(maxlen=WS_KLINE_LIMIT)
+                _ws["cache"][key] = dq
+            if dq and dq[-1][0] == t_open:
+                dq[-1] = row
+            else:
+                dq.append(row)
+            _ws["last_update"][key] = time.time()
+    except Exception as ex:
+        _ws["err"] = str(ex)
+
+def ws_start_kline_stream(symbols=None, interval=None):
+    """Start the shared kline stream once; safe to call multiple times."""
+    if not WS_KLINES_ENABLED:
+        return False
+    if ThreadedWebsocketManager is None:
+        _ws["err"] = "websocket-manager-unavailable"
+        return False
+    if _ws["running"]:
+        return True
+    syms = (symbols or AUTO_SYMBOLS)[:]
+    itv  = interval or AUTO_INTERVAL
+    try:
+        twm = ThreadedWebsocketManager(
+            api_key=os.getenv("BINANCE_API_KEY"),
+            api_secret=os.getenv("BINANCE_API_SECRET"),
+            tld=("us" if USE_US else "com"),
+            testnet=TESTNET,
+        )
+        twm.start()
+        for s in syms:
+            # kline stream for each symbol at AUTO_INTERVAL
+            twm.start_kline_socket(callback=_ws_on_kline, symbol=s.lower(), interval=itv)
+        _ws["twm"] = twm
+        _ws["running"] = True
+        return True
+    except Exception as ex:
+        _ws["err"] = str(ex)
+        try:
+            if "twm" in locals():
+                twm.stop()
+        except Exception:
+            pass
+        _ws["running"] = False
+        return False
+
+def get_klines_cached(symbol, interval, limit):
+    """Return recent klines from cache if fresh & sufficient; else None."""
+    key = f"{symbol}:{interval}"
+    with _ws["lock"]:
+        dq = _ws["cache"].get(key)
+        last = _ws["last_update"].get(key)
+        if dq is None or last is None:
+            return None
+        if (time.time() - last) > WS_STALE_SEC:
+            return None
+        if len(dq) < limit:
+            return None
+        return list(dq)[-limit:]
+
+def get_klines_any(client, symbol, interval, limit):
+    """Prefer WS cache; fallback to REST."""
+    rows = get_klines_cached(symbol, interval, limit)
+    if rows:
+        return rows
+    try:
+        return client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    except Exception:
+        return None
+# ========== end WebSocket kline cache/manager ==========
 
 # --- ensure DECISIONS exists (near the top, after deque import) ---
 try:
@@ -1130,6 +1244,11 @@ def auto_loop():
         kl_needed = max(EMA_SLOW, RSI_LEN, ATR_LEN) + 2
         kl_limit = KL_LIMIT if KL_LIMIT > 0 else kl_needed
 
+        # start WS stream (best-effort; falls back to REST if unavailable)
+        try:
+            ws_start_kline_stream(valid_symbols, AUTO_INTERVAL)
+        except Exception:
+            pass
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
 
@@ -1208,7 +1327,7 @@ def auto_loop():
 
                     # --- klines (with rate-limit handling) ---
                     try:
-                        kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=kl_limit)
+                        kl = get_klines_any(client, sym, AUTO_INTERVAL, kl_limit)
                     except BinanceAPIException as e:
                         msg = str(e)
                         _auto["err"] = f"klines: {msg}"
@@ -1485,6 +1604,9 @@ def _coerce_bool(v):
 
 def _as_config_dict():
     return dict(
+        WS_KLINES_ENABLED=WS_KLINES_ENABLED,
+        WS_STALE_SEC=WS_STALE_SEC,
+        WS_KLINE_LIMIT=WS_KLINE_LIMIT,
         ENABLE_TPSL=ENABLE_TPSL, TP_PCT=TP_PCT, SL_PCT=SL_PCT,
         ENABLE_TRAILING=ENABLE_TRAILING, TRAIL_ARM_PCT=TRAIL_ARM_PCT, TRAIL_PCT=TRAIL_PCT,
         PANIC_MODE=PANIC_MODE, PANIC_RSI_BTC=PANIC_RSI_BTC, PANIC_RSI_ETH=PANIC_RSI_ETH,
@@ -1520,7 +1642,7 @@ def _auto_config_view():
     data = request.get_json(silent=True) or {}
 
     # Allowed keys and coercions
-    bool_keys  = ["ENABLE_TPSL","ENABLE_TRAILING","ALLOW_TREND_ENTRY","ALLOW_TREND_EXIT","DYN_RISK"]
+    bool_keys  = ["ENABLE_TPSL","ENABLE_TRAILING","ALLOW_TREND_ENTRY","ALLOW_TREND_EXIT","DYN_RISK","WS_KLINES_ENABLED"]
     float_keys = [
         "TP_PCT","SL_PCT","TRAIL_ARM_PCT","TRAIL_PCT","PANIC_RSI_BTC","PANIC_RSI_ETH",
         "BUY_RSI_MAX","SELL_RSI_MIN","EMA_SEP_BPS","AUTO_RISK_USDT","PER_SYMBOL_MAX_USDT",
@@ -1529,13 +1651,13 @@ def _auto_config_view():
     int_keys   = [
         "EMA_FAST","EMA_SLOW","RSI_LEN","AUTO_COOLDOWN_SEC","AUTO_MAX_BUYS_PER_MIN",
         "CROSS_CONFIRM_BARS","ATR_LEN","KL_LIMIT","ACCOUNT_REFRESH_N","BACKOFF_1003_SEC",
-        "AUTO_POLL_SEC","DECISIONS_MAX"
+        "AUTO_POLL_SEC","DECISIONS_MAX","WS_STALE_SEC","WS_KLINE_LIMIT"
     ]
     str_keys   = ["PANIC_MODE","AUTO_INTERVAL"]
     float_keys += ["PORTFOLIO_MAX_USDT"]
     str_keys += ["TIME_WINDOWS_UTC"]
     int_keys   += ["MAX_LOSS_STREAK","LOSS_COOLDOWN_SEC"]
-
+    
     updated = {}
 
     for k in bool_keys:
@@ -1695,6 +1817,23 @@ def _auto_mode_view():
 
 _register("/auto/mode", "auto_mode", ["GET","POST"], _auto_mode_view)
 
+def _ws_status_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    with _ws["lock"]:
+        now = time.time()
+        status = {}
+        for s in AUTO_SYMBOLS:
+            key = f"{s}:{AUTO_INTERVAL}"
+            age = None
+            if key in _ws["last_update"]:
+                age = round(now - _ws["last_update"][key], 2)
+            bars = len(_ws["cache"].get(key, []))
+            status[key] = {"bars": bars, "last_age_sec": age}
+    return jsonify(ok=True, running=_ws["running"], err=_ws["err"], status=status)
+
+_register("/ws/status", "ws_status", ["GET"], _ws_status_view)
+
 # --- trailing control routes ---
 def _trail_enable_view():
     if not require_admin():
@@ -1801,7 +1940,7 @@ def _auto_step_view():
     for sym in AUTO_SYMBOLS:
         try:
             # ---- data fetch ----
-            kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=kl_limit)
+            kl = get_klines_any(client, sym, AUTO_INTERVAL, 120)
             if not kl:
                 items.append({"symbol": sym, "error": "no klines"})
                 continue
