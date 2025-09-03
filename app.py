@@ -1892,7 +1892,48 @@ def _ws_start_view():
     ok = ws_start_kline_stream(AUTO_SYMBOLS, AUTO_INTERVAL)
     return jsonify(ok=bool(ok), running=_ws.get("running"), err=_ws.get("err"))
 
+def _ws_status_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+
+    now_ms = int(time.time() * 1000)
+    itv = AUTO_INTERVAL
+    status = {}
+
+    # Show one entry per configured symbol+interval
+    for s in AUTO_SYMBOLS:
+        key = f"{s}:{itv}"
+        buf = _ws["streams"].get(key)
+        bars = (len(buf) if buf else 0)
+        last_ms = _ws["last"].get(key)
+        last_age_sec = (round((now_ms - last_ms) / 1000.0, 1) if last_ms else None)
+        status[key] = {"bars": bars, "last_age_sec": last_age_sec}
+
+    return jsonify(
+        ok=True,
+        running=bool(_ws.get("running")),
+        err=_ws.get("err"),
+        status=status,
+    )
 _register("/ws/status", "ws_status", ["GET"], _ws_status_view)
+
+def ws_stop():
+    twm = _ws.get("twm")
+    try:
+        if twm:
+            twm.stop()
+    except Exception:
+        pass
+    _ws["twm"] = None
+    _ws["running"] = False
+
+def _ws_stop_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    ws_stop()
+    return jsonify(ok=True, running=False, err=_ws.get("err"))
+
+_register("/ws/stop",   "ws_stop",   ["POST"], _ws_stop_view)  # optional
 
 # --- trailing control routes ---
 def _trail_enable_view():
