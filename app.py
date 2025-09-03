@@ -1468,9 +1468,9 @@ def auto_loop():
                         "have-base" if (base_bal * price >= min_notional) else "no-cross"
                     )
 
-            _auto["stop"].wait(30)
+            #_auto["stop"].wait(30)
 
-        app.logger.info("[AUTO] stopped")
+        #app.logger.info("[AUTO] stopped")
         
 # --- robust route (re)registration helpers (no decorators) ---
 def _replace_route(rule: str, endpoint: str):
