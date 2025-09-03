@@ -1312,10 +1312,13 @@ def auto_loop():
                 cap_left = max(0.0, float(PORTFOLIO_MAX_USDT) - float(portfolio_notional))
                 cap_ok   = (spend <= cap_left)
                 
+                                # --- time window gate ---
                 window_ok = schedule_allows_now_utc()
-                
+
+                # -------------------- BUY (quote notional) --------------------
                 if (
                     _auto["enabled"]
+                    and window_ok
                     and not _auto.get("panic_armed", False)
                     and buy_ok
                     and rsi_now <= BUY_RSI_MAX
@@ -1323,7 +1326,15 @@ def auto_loop():
                     and under_cap
                     and can_add_buy
                 ):
-                    spend = max(AUTO_RISK_USDT, min_notional)  # satisfy exchange min notional
+                    # choose spend (dynamic ATR sizing if enabled; else fixed)
+                    try:
+                        if DYN_RISK:
+                            spend = max(float(dynamic_spend_for_atr(atr_pct)), float(min_notional))
+                        else:
+                            spend = max(float(AUTO_RISK_USDT), float(min_notional))
+                    except Exception:
+                        spend = max(float(AUTO_RISK_USDT), float(min_notional))
+
                     try:
                         o = client.create_order(
                             symbol=sym,
@@ -1332,17 +1343,19 @@ def auto_loop():
                             quoteOrderQty=f"{spend:.2f}",
                             recvWindow=10000
                         )
-
                         record_trade_ts(sym)
 
                         fills = o.get("fills") or []
-                        filled_qty = (
-                            sum(float(f["qty"]) for f in fills)
-                            if fills else float(o.get("executedQty") or 0.0)
-                        )
-                        avg_price = (
-                            sum(float(f["price"]) * float(f["qty"]) for f in fills) / max(filled_qty, 1e-12)
-                        ) if fills else price
+                        if fills:
+                            filled_qty = sum(float(f["qty"]) for f in fills)
+                            avg_price  = (
+                                sum(float(f["price"]) * float(f["qty"]) for f in fills)
+                                / max(filled_qty, 1e-12)
+                            )
+                        else:
+                            filled_qty = float(o.get("executedQty") or 0.0)
+                            cq = float(o.get("cummulativeQuoteQty") or 0.0)
+                            avg_price = (cq / max(filled_qty, 1e-12)) if filled_qty > 0 else price
 
                         # persist trade row
                         try:
@@ -1355,10 +1368,8 @@ def auto_loop():
                         except Exception:
                             db.session.rollback()
 
-                        # ensure a DB position exists/updates avg price
+                        # ensure/refresh position + dashboard row
                         pos = ensure_position_on_buy(sym, filled_qty, avg_price)
-
-                        # record order locally for the dashboard
                         record_order_row(
                             o, 'BUY', sym, float(filled_qty), float(avg_price),
                             position_id=(pos.id if pos else None)
@@ -1379,12 +1390,11 @@ def auto_loop():
                         app.logger.exception("[AUTO] %s BUY exception", sym)
                         log_decision(sym, p2, q2, rsi_now, "HOLD", "buy-exception")
 
-                                # -------------------- SELL (step-safe quantity) -------------------
+                # -------------------- SELL (step-safe quantity) --------------------
                 elif sell_ok and rsi_now >= SELL_RSI_MIN and base_bal * price >= min_notional:
                     qty_str = qty_to_str(base_bal, step_str, min_qty_str)
                     if float(qty_str) * price >= min_notional and float(qty_str) > 0:
                         try:
-                            # market sell the step-safe quantity
                             o = client.create_order(
                                 symbol=sym,
                                 side="SELL",
@@ -1394,7 +1404,6 @@ def auto_loop():
                             )
                             record_trade_ts(sym)
 
-                            # compute filled qty and avg price
                             fills = o.get("fills") or []
                             if fills:
                                 filled_qty = sum(float(f["qty"]) for f in fills)
@@ -1418,7 +1427,7 @@ def auto_loop():
                             except Exception:
                                 db.session.rollback()
 
-                            # attach to most recent open LONG, if it exists
+                            # attach to latest open LONG (if any), record, and maybe close
                             pos = None
                             try:
                                 pos = (Position.query
@@ -1450,6 +1459,14 @@ def auto_loop():
 
                     else:
                         log_decision(sym, p2, q2, rsi_now, "HOLD", "qty-too-small")
+
+                # -------------------- HOLD (no trade) --------------------
+                else:
+                    log_decision(
+                        sym, p2, q2, rsi_now,
+                        "HOLD",
+                        "have-base" if (base_bal * price >= min_notional) else "no-cross"
+                    )
 
             _auto["stop"].wait(30)
 
