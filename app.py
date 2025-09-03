@@ -544,7 +544,15 @@ def get_klines_cached(symbol, interval, limit):
         return list(dq)[-limit:]
 
 def get_klines_any(client, symbol, interval, limit):
-    """Prefer WS cache; fallback to REST."""
+    """Prefer WS cache; start it lazily if enabled, else fall back to REST."""
+    # lazy start (one-shot) so /auto/step works even when auto_loop isn't running
+    if WS_KLINES_ENABLED and not _ws.get("running") and not _ws.get("start_attempted"):
+        _ws["start_attempted"] = True
+        try:
+            ws_start_kline_stream([symbol] if symbol else None, interval)
+        except Exception as ex:
+            _ws["err"] = f"lazy-start: {ex}"
+
     rows = get_klines_cached(symbol, interval, limit)
     if rows:
         return rows
