@@ -1461,14 +1461,14 @@ def auto_loop():
                         log_decision(sym, p2, q2, rsi_now, "HOLD", "qty-too-small")
 
                 # -------------------- HOLD (no trade) --------------------
-                    else:
-                         log_decision(
-                             sym, p2, q2, rsi_now,
-                             "HOLD",
-                             "have-base" if (base_bal * price >= min_notional) else "no-cross"
+                else:
+                     log_decision(
+                         sym, p2, q2, rsi_now,
+                         "HOLD",
+                         "have-base" if (base_bal * price >= min_notional) else "no-cross"
                     )
-                    _auto["stop"].wait(30)
-                    app.logger.info("[AUTO] stopped")
+                _auto["stop"].wait(30)
+                pp.logger.info("[AUTO] stopped")
         
 # --- robust route (re)registration helpers (no decorators) ---
 def _replace_route(rule: str, endpoint: str):
