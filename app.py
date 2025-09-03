@@ -1925,28 +1925,47 @@ def _debug_live_buy_view():
 
         step_str, min_qty_str, min_notional = symbol_filters(c, sym)
         price = float(c.get_symbol_ticker(symbol=sym)["price"])
-        spend = max(usdt, min_notional or usdt)
+        spend = max(usdt, (min_notional or usdt))
 
-        qty_str = qty_to_str(spend/price, step_str, min_qty_str)
-
-        # try order, respecting DRY_RUN and quote fallback
+        # try step-safe qty first; fall back to quoteOrderQty
+        qty_str = qty_to_str(spend / price, step_str, min_qty_str)
         try:
-            # first attempt: exact quantity
-            o = place_market_order(c, sym, "BUY", qty_str=qty_str, price_hint=price)
-        except BinanceAPIException as e:
-            if ("-1013" in str(e)) or ("LOT_SIZE" in str(e)) or ("Illegal characters" in str(e)):
-                o = place_market_order(c, sym, "BUY", quoteOrderQty=f"{spend:.2f}", price_hint=price)
-        else:
-             return jsonify(ok=False, error=str(e)), 400
+            o = c.create_order(
+                symbol=sym, side="BUY",
+                type=Client.ORDER_TYPE_MARKET,
+                quantity=qty_str, recvWindow=10000
+            )
+        except BinanceAPIException as ex:
+            msg = str(ex)
+            if ("-1013" in msg) or ("LOT_SIZE" in msg) or ("Illegal characters" in msg):
+                o = c.create_order(
+                    symbol=sym, side="BUY",
+                    type=Client.ORDER_TYPE_MARKET,
+                    quoteOrderQty=f"{spend:.2f}", recvWindow=10000
+                )
+            else:
+                return jsonify(ok=False, error=msg), 400
 
-        return jsonify(ok=True,
-                       status=o.get("status"),
-                       executedQty=o.get("executedQty"),
-                       cummulativeQuoteQty=o.get("cummulativeQuoteQty"))
-    except BinanceAPIException as e:
-        return jsonify(ok=False, error=str(e)), 400
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+        # response summary
+        fills = o.get("fills") or []
+        if fills:
+            executed_qty = sum(float(f["qty"]) for f in fills)
+            cquote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+        else:
+            executed_qty = float(o.get("executedQty") or 0.0)
+            cquote = float(o.get("cummulativeQuoteQty") or 0.0)
+
+        return jsonify(
+            ok=True,
+            status=o.get("status"),
+            executedQty=executed_qty,
+            cummulativeQuoteQty=cquote
+        )
+
+    except BinanceAPIException as ex2:
+        return jsonify(ok=False, error=str(ex2)), 400
+    except Exception as ex3:
+        return jsonify(ok=False, error=str(ex3)), 500
 
 # --- bind (and replace if already bound) ---
 _register("/auto/status",    "auto_status_v2",    ["GET"],  _auto_status_view)
