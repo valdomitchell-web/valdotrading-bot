@@ -552,6 +552,11 @@ def start_ws_if_needed():
         twm.start()
         _ws["twm"] = twm
         _ws["subs"].clear()
+        
+        # ... create TWM + start subscriptions ...
+        _ws["running"] = True
+        # backfill so we don’t start empty
+        prime_ws_cache_via_rest()
 
         interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
         for sym in globals().get("AUTO_SYMBOLS", ["BTCUSDT"]):
@@ -645,49 +650,45 @@ def _ensure_stream(symbol, interval):
 
 def _on_kline(msg):
     try:
-        k = msg.get('k') or {}
-        # event time (ms) is in msg['E']; kline close time in k['T'] (ms). Use 'E' for “freshness”.
-        evt_ms = msg.get('E') or k.get('T')
-        key = f"{k.get('s','').upper()}:{k.get('i','').lower()}"  # e.g., "LINKUSDT:30m"
+        if msg.get("e") != "kline":
+            return
+        k = msg.get("k") or {}
+        sym = k.get("s") or ""
+        itv = k.get("i") or str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        key = _ws_key(sym, itv)
 
-        # update ring buffer …
-        _ws['bufs'][key].append( (k['t'], k['o'], k['h'], k['l'], k['c'], k['v'], k['x']) )
+        # mark we got an event (even if candle not closed)
+        _ws["last_evt_ms"][key] = int(msg.get("E") or time.time() * 1000)
 
-        _ws['last_evt_ms'][key] = evt_ms
-        _ws['bars'][key] = len(_ws['bufs'][key])
-
-    except Exception as e:
-        _ws['err'] = f"kline cb: {e}"
-
-        # Build REST-shaped kline row (match /api/v3/klines)
-        # [ openTime, open, high, low, close, volume, closeTime, qav, trades, takerBase, takerQuote, ignore ]
-        row = [
-            int(k.get("t") or 0),
-            float(k.get("o") or 0.0),
-            float(k.get("h") or 0.0),
-            float(k.get("l") or 0.0),
-            float(k.get("c") or 0.0),
-            float(k.get("v") or 0.0),
-            int(k.get("T") or 0),
-            float(k.get("q") or 0.0),
-            int(k.get("n") or 0),
-            float(k.get("V") or 0.0),
-            float(k.get("Q") or 0.0),
-            0
-        ]
-
-        buf = _ensure_stream(sym, interval)
-        # Replace last if same openTime, else append
-        if buf and buf[-1][0] == row[0]:
-            buf[-1] = row
-        else:
-            buf.append(row)
-
-        # Update last closed bar time (when x==True)
+        # only add to cache when candle closes (k['x'] == True)
         if k.get("x"):
-            _ws["last"][key] = row[6]
-    except Exception as ex:
-        _ws["err"] = f"on_kline: {ex}"
+            close = float(k.get("c") or 0.0)
+            if close > 0:
+                buf = _ws["cache"].setdefault(key, [])
+                buf.append(close)
+                limit = int(globals().get("WS_KLINE_LIMIT", 240))
+                if len(buf) > limit:
+                    del buf[: len(buf) - limit]
+    except Exception as e:
+        _ws["err"] = f"on_kline:{e}"
+        
+def prime_ws_cache_via_rest():
+    try:
+        c = make_client()
+        itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        syms = list(globals().get("AUTO_SYMBOLS", ["BTCUSDT"]))
+        limit = int(globals().get("WS_KLINE_LIMIT", 240))
+        for s in syms:
+            try:
+                kl = c.get_klines(symbol=s, interval=itv, limit=min(limit, 500))
+                closes = [float(x[4]) for x in kl if float(x[4]) > 0]
+                key = _ws_key(s, itv)
+                _ws["cache"][key] = closes[-limit:]
+                _ws["last_evt_ms"][key] = int(time.time() * 1000)
+            except Exception:
+                pass
+    except Exception as e:
+        _ws["err"] = f"ws-prime:{e}"
 
 def _ws_on_kline(msg):
     """Binance WS callback; normalizes to REST-like kline rows."""
@@ -719,6 +720,10 @@ def _ws_on_kline(msg):
             _ws["last_update"][key] = time.time()
     except Exception as ex:
         _ws["err"] = str(ex)
+
+def _ws_key(sym: str, interval: str) -> str:
+    # Symbols come uppercase from Binance; interval is lowercase like "30m"
+    return f"{sym.upper()}:{interval.lower()}"
 
 def ws_start_kline_stream(symbols=None, interval=None):
     """
@@ -2084,20 +2089,18 @@ def _ws_start_view():
 def _ws_status_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-    try:
-        now_ms = int(time.time() * 1000)
-        interval = str(AUTO_INTERVAL).lower()
-        keys = [f"{s}:{interval}" for s in AUTO_SYMBOLS]
-        keys += [k for k in _ws["bufs"].keys() if k not in keys]
-        out = {}
-        for k in keys:
-            evt = _ws["last_evt_ms"].get(k)
-            age = round((now_ms - evt)/1000.0, 1) if evt else None
-            out[k] = {"bars": _ws["bars"].get(k, 0), "last_age_sec": age}
-        return jsonify(ok=True, running=_ws.get("running", False), err=_ws.get("err"),
-                       status=out, subs=list(_ws.get("subs", [])))
-    except Exception as e:
-        return jsonify(ok=False, running=_ws.get("running", False), err=str(e))
+    itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+    syms = list(globals().get("AUTO_SYMBOLS", ["BTCUSDT"]))
+    out = {}
+    now_ms = int(time.time() * 1000)
+    for s in syms:
+        k = _ws_key(s, itv)
+        last = _ws["last_evt_ms"].get(k)
+        out[k] = {
+            "bars": len(_ws["cache"].get(k, [])),
+            "last_age_sec": None if last is None else max(0, (now_ms - int(last)) // 1000),
+        }
+    return jsonify(ok=True, running=_ws.get("running", False), err=_ws.get("err"), status=out)
 
 def _ws_stop_view():
     if not require_admin():
