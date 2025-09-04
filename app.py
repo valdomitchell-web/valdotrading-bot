@@ -1796,60 +1796,41 @@ try:
 except NameError:
     _ws = {"twm": None, "streams": {}, "last": {}, "running": False, "err": None}
 
-    def _on_kline(msg):
-        try:
-            if msg.get("e") != "kline":
-                return
-            k = msg["k"]
-            sym = msg["s"]       # e.g. 'BTCUSDT'
-            iv  = k["i"]         # e.g. '30m'
-            key = f"{sym}:{iv}"
-
-            # normalize to "REST-like" bar
-            bar = [
-                int(k["t"]),                      # open time
-                float(k["o"]), float(k["h"]),
-                float(k["l"]), float(k["c"]),     # o,h,l,c
-                float(k.get("v", 0.0)),           # volume
-                int(k["T"]),                      # close time
-            ]
-
-            buf = _ws["streams"].get(key)
-            if buf is None:
-                buf = deque(maxlen=lim)
-                _ws["streams"][key] = buf
-
-            # upsert last bar by open-time
-            if buf and buf[-1][0] == bar[0]:
-                buf[-1] = bar
-            else:
-                buf.append(bar)
-
-            _ws["last"][key] = int(time.time() * 1000)
-        except Exception as e:
-            _ws["err"] = f"ws-cb: {e}"
-
-    # subscribe one kline stream per symbol
+def _on_kline(msg):
+    """Normalize Binance WS kline to the same shape we read everywhere."""
     try:
-        for s in AUTO_SYMBOLS:
-            _ws["twm"].start_kline_socket(
-                callback=_on_kline,
-                symbol=s.lower(),
-                interval=AUTO_INTERVAL
-            )
-        _ws["running"] = True
-        _ws["err"] = None
-    except Exception as e:
-        _ws["err"] = f"subscribe: {e}"
-        _ws["running"] = False
-        try:
-            _ws["twm"].stop()
-        except Exception:
-            pass
-        _ws["twm"] = None
-return jsonify(ok=False, error=_ws["err"]), 500
+        if msg.get("e") != "kline":
+            return
+        k = msg.get("k") or {}
+        s = (msg.get("s") or k.get("s") or "").upper()
+        itv = (k.get("i") or str(globals().get("AUTO_INTERVAL", "30m"))).lower()
+        key = f"{s}:{itv}"
 
-return jsonify(ok=True, running=True)
+        t_open  = int(k.get("t") or 0)
+        t_close = int(k.get("T") or 0)
+        o = float(k.get("o") or 0)
+        h = float(k.get("h") or 0)
+        l = float(k.get("l") or 0)
+        c = float(k.get("c") or 0)
+        v = float(k.get("v") or 0)
+
+        row = [t_open, o, h, l, c, v, t_close]
+
+        dq = _ws["streams"].get(key)
+        if dq is None:
+            from collections import deque
+            dq = deque(maxlen=max(int(globals().get("WS_KLINE_LIMIT", 240)), 1))
+            _ws["streams"][key] = dq
+
+        # upsert last bar by open time
+        if dq and dq[-1][0] == t_open:
+            dq[-1] = row
+        else:
+            dq.append(row)
+
+        _ws["last"][key] = int(msg.get("E") or time.time() * 1000)
+    except Exception as e:
+        _ws["err"] = f"on_kline:{e}"
 
 def _ws_stop_view():
     if not require_admin():
