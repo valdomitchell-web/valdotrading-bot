@@ -642,11 +642,11 @@ def ws_start_kline_stream(symbols=None, interval=None):
 
     # subscribe
     for s in syms:
-    twm.start_kline_socket(callback=_on_kline, symbol=s.lower(), interval=itv)
+        twm.start_kline_socket(callback=_on_kline, symbol=s.lower(), interval=itv)
 
     # precreate buffers with the same key shape
     for s in syms:
-    _ensure_stream(s, itv)  # inside, use key = f"{symbol.upper()}:{interval.lower()}"
+        _ensure_stream(s, itv)  # inside, use key = f"{symbol.upper()}:{interval.lower()}"
 
     try:
         # Create TWM with same creds/tld/testnet as your REST client
