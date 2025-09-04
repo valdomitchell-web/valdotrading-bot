@@ -513,9 +513,6 @@ try:
 except Exception:
     ThreadedWebsocketManager = None
 
-def _ws_key(symbol, interval):
-    return f"{symbol}:{interval}"
-
 def _ensure_stream(symbol, interval):
     itv = str(AUTO_INTERVAL).lower()
     key = f"{s}:{itv}"
@@ -623,56 +620,41 @@ def _ws_key(sym: str, interval: str) -> str:
     return f"{sym.upper()}:{interval.lower()}"
 
 def ws_start_kline_stream(symbols=None, interval=None):
-    """
-    Start a spot kline WS for the given symbols+interval.
-    Returns True on success, False otherwise (and sets _ws['err']).
-    """
     if not WS_KLINES_ENABLED:
         _ws["err"] = "ws disabled"
         return False
     if ThreadedWebsocketManager is None:
         _ws["err"] = "python-binance missing (ThreadedWebsocketManager)"
         return False
-
     if _ws.get("running"):
         return True
 
-    syms = [str(s).upper() for s in (symbols or AUTO_SYMBOLS) if s and str(s).upper().endswith("USDT")]
+    syms = [str(s).upper() for s in (symbols or AUTO_SYMBOLS)]
     itv  = str(interval or AUTO_INTERVAL).lower()
 
-    # subscribe
-    for s in syms:
-        twm.start_kline_socket(callback=_on_kline, symbol=s.lower(), interval=itv)
-
-    # precreate buffers with the same key shape
-    for s in syms:
-        _ensure_stream(s, itv)  # inside, use key = f"{symbol.upper()}:{interval.lower()}"
+    try:
+        from binance.streams import ThreadedWebsocketManager as TWM
+    except Exception:
+        from binance import ThreadedWebsocketManager as TWM
 
     try:
-        # Create TWM with same creds/tld/testnet as your REST client
-        c = make_client()
-        tld = "us" if USE_US else "com"
-        twm = ThreadedWebsocketManager(
+        twm = TWM(
             api_key=os.getenv("BINANCE_API_KEY"),
             api_secret=os.getenv("BINANCE_API_SECRET"),
-            tld=tld,
+            tld=("us" if USE_US else "com"),
             testnet=TESTNET,
         )
         twm.start()
+
         for s in syms:
-            twm.start_kline_socket(callback=_on_kline, symbol=s, interval=itv)
+            twm.start_kline_socket(callback=_on_kline, symbol=s.lower(), interval=itv)
+            key = _ws_key(s, itv)
+            _ws["streams"].setdefault(key, deque(maxlen=int(WS_KLINE_LIMIT or 240)))
 
         _ws["twm"] = twm
         _ws["running"] = True
         _ws["err"] = None
         _ws["start_attempted"] = True
-
-        # precreate buffers
-        for s in syms:
-            _ensure_stream(s, itv)
-
-        # seed once so bars > 0 right away
-        prime_ws_cache_via_rest()
         return True
     except Exception as ex:
         _ws["err"] = str(ex)
@@ -1984,22 +1966,18 @@ def _ws_status_view():
         return jsonify(ok=False, error="auth"), 401
 
     now_ms = int(time.time() * 1000)
-    iitv = str(AUTO_INTERVAL).lower()
+    itv = str(AUTO_INTERVAL).lower()
+
+    status = {}
     for s in AUTO_SYMBOLS:
-        key = f"{s.upper()}:{itv}"   # or: key = _ws_key(s, itv) if you keep that helper
+        key = f"{str(s).upper()}:{itv}"
         buf = _ws["streams"].get(key)
-        bars = (len(buf) if buf else 0)
+        bars = len(buf) if buf else 0
         last_ms = _ws["last"].get(key)
         last_age_sec = (round((now_ms - last_ms) / 1000.0, 1) if last_ms else None)
         status[key] = {"bars": bars, "last_age_sec": last_age_sec}
 
-    return jsonify(
-        ok=True,
-        running=bool(_ws.get("running")),
-        err=_ws.get("err"),
-        status=status,
-    )
-_register("/ws/status", "ws_status", ["GET"], _ws_status_view)
+    return jsonify(ok=True, running=bool(_ws.get("running")), err=_ws.get("err"), status=status)
 
 def ws_stop():
     twm = _ws.get("twm")
