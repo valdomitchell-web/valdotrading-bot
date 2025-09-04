@@ -6,3 +6,5 @@ Werkzeug
 python-binance
 requests
 psycopg2-binary
+python-binance==1.0.19
+websocket-client==1.6.2
