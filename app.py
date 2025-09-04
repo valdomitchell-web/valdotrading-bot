@@ -473,15 +473,15 @@ _ws.setdefault("twm", None)
 _ws.setdefault("running", False)
 _ws.setdefault("err", None)
 
-    # If not running, try to (re)start
-    if not _ws.get("running"):
-        try:
-            start_ws_if_needed()
-        except Exception as e:
-            _ws["err"] = f"ws-restart: {e}"
-            _ws["running"] = False
-            _ws["twm"] = None
-        return
+# If not running, try to (re)start
+if not _ws.get("running"):
+    try:
+        start_ws_if_needed()
+    except Exception as e:
+        _ws["err"] = f"ws-restart: {e}"
+        _ws["running"] = False
+        _ws["twm"] = None
+    return
 
     # If running, check for staleness; restart if everything is stale
     try:
