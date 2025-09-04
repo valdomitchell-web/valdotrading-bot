@@ -454,6 +454,9 @@ WS_KLINE_LIMIT    = int(os.getenv("WS_KLINE_LIMIT", "240"))
 WS_SEED_ON_START = globals().get("WS_SEED_ON_START", True)     # seed buffers once on start
 WS_SEED_LIMIT    = int(globals().get("WS_SEED_LIMIT", 8))      # tiny to keep REST weight minimal
 
+# --- WS helpers (start/stop/supervise) ---------------------------------------
+from collections import defaultdict, deque
+
 # central WS state
 _ws = {
     "twm": None,
@@ -464,140 +467,11 @@ _ws = {
     "start_attempted": False,
 }
 
-# --- WS helpers (start/stop/supervise) ---------------------------------------
-from collections import defaultdict, deque
-
-# Minimal WS state if you don't already have it
-_ws = globals().get("_ws") or {
-    "twm": None, "running": False, "err": None,
-    "bufs": defaultdict(lambda: deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240)))),
-    "bars": {},                # key -> int
-    "last_evt_ms": {},         # key -> int ms
-    "subs": [],                # list of "SYMBOL:interval"
-}
-
 # Ensure _ws has all keys no matter prior state
 _ws = globals().get("_ws") or {}
 _ws.setdefault("twm", None)
 _ws.setdefault("running", False)
 _ws.setdefault("err", None)
-_ws.setdefault("subs", [])                                    # <— fixes 'subs' KeyError
-_ws.setdefault("bufs", defaultdict(lambda: deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240)))))
-_ws.setdefault("bars", {})
-_ws.setdefault("last_evt_ms", {})
-
-def _kline_cb_factory(symbol_upper: str):
-    key_prefix = f"{symbol_upper}:"
-    def _on_kline(msg):
-        try:
-            k = msg.get("k") or {}
-            if not k:
-                return
-            interval = (k.get("i") or "").lower()
-            key = key_prefix + interval
-            _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
-            _ws["bufs"][key].append([
-                k.get("t"), k.get("o"), k.get("h"), k.get("l"),
-                k.get("c"), k.get("v"), k.get("x")
-            ])
-            _ws["bars"][key] = len(_ws["bufs"][key])
-            evt_ms = msg.get("E") or k.get("T")
-            if evt_ms is not None:
-                _ws["last_evt_ms"][key] = int(evt_ms)
-        except Exception as e:
-            _ws["err"] = f"kline cb: {e}"
-    return _on_kline
-
-def _seed_ws_buffers_once():
-    """Seed each symbol's buffer once via REST so bars > 0 immediately."""
-    if not WS_SEED_ON_START:
-        return
-    try:
-        client = make_client()
-        interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
-        for sym in globals().get("AUTO_SYMBOLS", ["BTCUSDT"]):
-            key = f"{sym}:{interval}"
-            if _ws["bars"].get(key, 0) > 0:
-                continue
-            kl = client.get_klines(symbol=sym, interval=interval, limit=WS_SEED_LIMIT)
-            if not kl:
-                continue
-            dq = _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
-            dq.clear()
-            for r in kl:
-                # r = [open_time, open, high, low, close, volume, close_time, ...]
-                dq.append([r[0], str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5]), True])
-            _ws["bars"][key] = len(dq)
-            _ws["last_evt_ms"][key] = int(kl[-1][6])  # use close_time as last event
-    except Exception as e:
-        _ws["err"] = f"ws-seed: {e}"
-
-def start_ws_if_needed():
-    if not globals().get("WS_KLINES_ENABLED", True):
-        return False
-    if _ws.get("running"):
-        return True
-    try:
-        try:
-            from binance.streams import ThreadedWebsocketManager as TWM
-        except Exception:
-            from binance import ThreadedWebsocketManager as TWM
-
-        twm = TWM(
-            api_key=os.getenv("BINANCE_API_KEY"),
-            api_secret=os.getenv("BINANCE_API_SECRET"),
-            tld=("us" if globals().get("USE_US") else "com"),
-            testnet=globals().get("TESTNET", False),
-        )
-        twm.start()
-        _ws["twm"] = twm
-        _ws["subs"].clear()
-        
-        # ... create TWM + start subscriptions ...
-        _ws["running"] = True
-        # backfill so we don’t start empty
-        prime_ws_cache_via_rest()
-
-        interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
-        for sym in globals().get("AUTO_SYMBOLS", ["BTCUSDT"]):
-            sym_uc = str(sym).upper()
-            sym_lc = sym_uc.lower()
-            cb = _kline_cb_factory(sym_uc)
-            # param names vary by version; be explicit
-            twm.start_kline_socket(symbol=sym_lc, interval=interval, callback=cb)
-            _ws["subs"].append(f"{sym_uc}:{interval}")
-            key = f"{sym_uc}:{interval}"
-            _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
-            _ws["bars"].setdefault(key, 0)
-
-        # one-time seed so bars > 0 right after start
-        _seed_ws_buffers_once()
-
-        _ws["running"] = True
-        _ws["err"] = None
-        return True
-    except Exception as e:
-        _ws["err"] = f"ws-start: {e}"
-        _ws["running"] = False
-        _ws["twm"] = None
-        return False
-
-def stop_ws():
-    try:
-        twm = _ws.get("twm")
-        if twm:
-            twm.stop()
-    except Exception as e:
-        _ws["err"] = f"ws-stop: {e}"
-    finally:
-        _ws["twm"] = None
-        _ws["running"] = False
-        _ws["subs"].clear()
-
-def ws_supervisor_tick():
-    # Skip if WS disabled
-    if not globals().get("WS_KLINES_ENABLED", True):
-        return
 
     # If not running, try to (re)start
     if not _ws.get("running"):
@@ -643,48 +517,71 @@ def _ws_key(symbol, interval):
     return f"{symbol}:{interval}"
 
 def _ensure_stream(symbol, interval):
-    key = _ws_key(symbol, interval)
+    itv = str(AUTO_INTERVAL).lower()
+    key = f"{s}:{itv}"
     if key not in _ws["streams"]:
         _ws["streams"][key] = deque(maxlen=max(WS_KLINE_LIMIT, 1))
     return _ws["streams"][key]
 
 def _on_kline(msg):
+    """Normalize Binance WS kline to the same shape we read everywhere."""
     try:
         if msg.get("e") != "kline":
             return
         k = msg.get("k") or {}
-        sym = k.get("s") or ""
-        itv = k.get("i") or str(globals().get("AUTO_INTERVAL", "30m")).lower()
-        key = _ws_key(sym, itv)
+        s = (msg.get("s") or k.get("s") or "").upper()
+        itv = (k.get("i") or str(globals().get("AUTO_INTERVAL", "30m"))).lower()
+        key = f"{s}:{itv}"
 
-        # mark we got an event (even if candle not closed)
-        _ws["last_evt_ms"][key] = int(msg.get("E") or time.time() * 1000)
+        t_open  = int(k.get("t") or 0)
+        t_close = int(k.get("T") or 0)
+        o = float(k.get("o") or 0)
+        h = float(k.get("h") or 0)
+        l = float(k.get("l") or 0)
+        c = float(k.get("c") or 0)
+        v = float(k.get("v") or 0)
 
-        # only add to cache when candle closes (k['x'] == True)
-        if k.get("x"):
-            close = float(k.get("c") or 0.0)
-            if close > 0:
-                buf = _ws["cache"].setdefault(key, [])
-                buf.append(close)
-                limit = int(globals().get("WS_KLINE_LIMIT", 240))
-                if len(buf) > limit:
-                    del buf[: len(buf) - limit]
+        row = [t_open, o, h, l, c, v, t_close]
+
+        dq = _ws["streams"].get(key)
+        if dq is None:
+            from collections import deque
+            dq = deque(maxlen=max(int(globals().get("WS_KLINE_LIMIT", 240)), 1))
+            _ws["streams"][key] = dq
+
+        # upsert last bar by open time
+        if dq and dq[-1][0] == t_open:
+            dq[-1] = row
+        else:
+            dq.append(row)
+
+        _ws["last"][key] = int(msg.get("E") or time.time() * 1000)
     except Exception as e:
         _ws["err"] = f"on_kline:{e}"
         
 def prime_ws_cache_via_rest():
+    """Backfill a few bars so status/step work instantly."""
     try:
         c = make_client()
-        itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        itv = (str(globals().get("AUTO_INTERVAL", "30m"))).lower()
         syms = list(globals().get("AUTO_SYMBOLS", ["BTCUSDT"]))
-        limit = int(globals().get("WS_KLINE_LIMIT", 240))
+        limit = min(int(globals().get("WS_KLINE_LIMIT", 240)), 500)
         for s in syms:
             try:
-                kl = c.get_klines(symbol=s, interval=itv, limit=min(limit, 500))
-                closes = [float(x[4]) for x in kl if float(x[4]) > 0]
-                key = _ws_key(s, itv)
-                _ws["cache"][key] = closes[-limit:]
-                _ws["last_evt_ms"][key] = int(time.time() * 1000)
+                kl = c.get_klines(symbol=s, interval=itv, limit=max(10, min(limit, 120)))
+                if not kl:
+                    continue
+                from collections import deque
+                key = f"{s}:{itv}"
+                dq = _ws["streams"].get(key)
+                if dq is None:
+                    dq = deque(maxlen=max(int(globals().get("WS_KLINE_LIMIT", 240)), 1))
+                    _ws["streams"][key] = dq
+                dq.clear()
+                for r in kl:
+                    # REST kline: [open_time, o,h,l,c, volume, close_time, ...]
+                    dq.append([int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]), int(r[6])])
+                _ws["last"][key] = int(kl[-1][6])
             except Exception:
                 pass
     except Exception as e:
@@ -740,8 +637,16 @@ def ws_start_kline_stream(symbols=None, interval=None):
     if _ws.get("running"):
         return True
 
-    syms = [s for s in (symbols or AUTO_SYMBOLS) if s and s.endswith("USDT")]
-    itv  = interval or AUTO_INTERVAL
+    syms = [str(s).upper() for s in (symbols or AUTO_SYMBOLS) if s and str(s).upper().endswith("USDT")]
+    itv  = str(interval or AUTO_INTERVAL).lower()
+
+    # subscribe
+    for s in syms:
+    twm.start_kline_socket(callback=_on_kline, symbol=s.lower(), interval=itv)
+
+    # precreate buffers with the same key shape
+    for s in syms:
+    _ensure_stream(s, itv)  # inside, use key = f"{symbol.upper()}:{interval.lower()}"
 
     try:
         # Create TWM with same creds/tld/testnet as your REST client
@@ -757,19 +662,24 @@ def ws_start_kline_stream(symbols=None, interval=None):
         for s in syms:
             twm.start_kline_socket(callback=_on_kline, symbol=s, interval=itv)
 
-        _ws["twm"] = twm
+                _ws["twm"] = twm
         _ws["running"] = True
         _ws["err"] = None
         _ws["start_attempted"] = True
-        # precreate buffers so /ws/status shows keys immediately
+
+        # precreate buffers
         for s in syms:
             _ensure_stream(s, itv)
+
+        # seed once so bars > 0 right away
+        prime_ws_cache_via_rest()
         return True
     except Exception as ex:
         _ws["err"] = str(ex)
         _ws["running"] = False
         _ws["twm"] = None
         return False
+        
 def get_klines_cached(symbol, interval, limit):
     """Return up to `limit` klines from WS cache in REST shape; None if empty."""
     key = _ws_key(symbol, interval)
@@ -789,10 +699,14 @@ def get_klines_any(client, symbol, interval, limit):
             ws_start_kline_stream([symbol] if symbol else None, interval)
         except Exception as ex:
             _ws["err"] = f"lazy-start: {ex}"
+    sym_uc = str(symbol).upper()
+    itv    = str(interval).lower()
 
-    rows = get_klines_cached(symbol, interval, limit)
+    rows = get_klines_cached(sym_uc, itv, limit)
     if rows:
         return rows
+    return client.get_klines(symbol=sym_uc, interval=itv, limit=limit)
+
     try:
         return client.get_klines(symbol=symbol, interval=interval, limit=limit)
     except Exception:
@@ -924,10 +838,6 @@ def schedule_allows_now_utc() -> bool:
         if start_ok and end_ok:
             return True
     return False
-
-def is_rate_limit_err(e) -> bool:
-    s = str(e)
-    return ("-1003" in s) or ("Too much request weight" in s)
 
 def new_coid(prefix: str, sym: str) -> str:
     # short, unique clientOrderId to dedup exchange retries
@@ -1202,35 +1112,6 @@ def panic_liquidate_all(client, symbols, bals, flt_map):
             summary.append({"symbol": sym, "error": str(e)})
     return summary
 
-def atr_from_klines(klines, n=14):
-    """
-    Wilder ATR using klines. Returns the latest ATR (float) or None if not enough bars.
-    """
-    if not klines or len(klines) < n + 2:
-        return None
-
-    highs  = [float(k[2]) for k in klines]
-    lows   = [float(k[3]) for k in klines]
-    closes = [float(k[4]) for k in klines]
-
-    trs = []
-    for i in range(len(klines)):
-        if i == 0:
-            tr = highs[i] - lows[i]
-        else:
-            tr = max(highs[i] - lows[i],
-                     abs(highs[i] - closes[i-1]),
-                     abs(lows[i]  - closes[i-1]))
-        trs.append(tr)
-
-    # Wilder smoothing
-    if len(trs) < n + 1:
-        return None
-    atr = sum(trs[1:n+1]) / n
-    for i in range(n+1, len(trs)):
-        atr = ((atr * (n - 1)) + trs[i]) / n
-    return atr
-
 def atr_from_klines(klines, n):
     """Wilder's ATR from Binance klines (H,L,C). Returns float or None."""
     highs = [float(k[2]) for k in klines]
@@ -1251,61 +1132,7 @@ def atr_from_klines(klines, n):
     for tr in trs[n:]:
         atr = ((n - 1) * atr + tr) / n
     return atr
-
-def is_rate_limit_err(e: Exception) -> bool:
-    s = str(e)
-    return ("-1003" in s) or ("Too much request weight" in s)
-
-def place_market_order(client, symbol: str, side: str, *,
-                       qty_str: str = None,
-                       quoteOrderQty: str = None,
-                       price_hint: float = None):
-    """
-    One place to send MARKET orders:
-    - DRY_RUN fabricates a fill with price_hint.
-    - Real mode retries on -1003 with small backoff.
-    - Always returns an object shaped like a Binance order.
-    """
-    assert side in ("BUY", "SELL")
-    if DRY_RUN:
-        now = int(time.time() * 1000)
-        if price_hint is None:
-            price_hint = float(client.get_symbol_ticker(symbol=symbol)["price"])
-        if side == "BUY":
-            # Prefer quoteOrderQty; fall back to qty
-            if quoteOrderQty:
-                qquote = float(quoteOrderQty)
-                filled_qty = qquote / max(price_hint, 1e-12)
-            else:
-                filled_qty = float(qty_str or "0")
-                qquote = filled_qty * price_hint
-        else:
-            filled_qty = float(qty_str or "0")
-            qquote = filled_qty * price_hint
-
-        o = {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "status": "FILLED",
-            "transactTime": now,
-            "executedQty": f"{filled_qty:.10f}",
-            "cummulativeQuoteQty": f"{qquote:.10f}",
-            "fills": [{"price": f"{price_hint:.10f}", "qty": f"{filled_qty:.10f}"}],
-            "isDryRun": True,
-        }
-        if quoteOrderQty:
-            o["quoteOrderQty"] = quoteOrderQty
-        if qty_str:
-            o["origQty"] = qty_str
-        return o
-
-    # Real submission with retries
-    params = dict(
-        symbol=symbol,
-        side=side,
-        type=Client.ORDER
-        )
+    
 # --- indicators ---
 def ema(series, n):
     k = 2/(n+1)
@@ -1978,59 +1805,6 @@ try:
 except NameError:
     _ws = {"twm": None, "streams": {}, "last": {}, "running": False, "err": None}
 
-def _ws_start_view():
-    if not require_admin():
-        return jsonify(ok=False, error="auth"), 401
-
-    if not WS_KLINES_ENABLED:
-        return jsonify(ok=False, error="WS_KLINES_ENABLED=false"), 400
-
-    # already running?
-    if _ws.get("running") and _ws.get("twm"):
-        return jsonify(ok=True, running=True, already=True)
-
-    # init per-symbol buffers
-    itv = AUTO_INTERVAL
-    lim = int(WS_KLINE_LIMIT or 240)
-    for s in AUTO_SYMBOLS:
-        _ws["streams"][f"{s}:{itv}"] = deque(maxlen=lim)
-
-    # import TWM (handle package variations)
-    twm_cls = None
-    err = None
-    try:
-        from binance import ThreadedWebsocketManager as _TWM
-        twm_cls = _TWM
-    except Exception as e:
-        err = e
-        try:
-            from binance.streams import ThreadedWebsocketManager as _TWM
-            twm_cls = _TWM
-        except Exception as e2:
-            err = e2
-
-    if not twm_cls:
-        _ws["err"] = f"ThreadedWebsocketManager not available: {err}"
-        return jsonify(ok=False, error=_ws["err"]), 500
-
-    # start the manager
-    try:
-        twm = twm_cls(
-            api_key=os.getenv("BINANCE_API_KEY"),
-            api_secret=os.getenv("BINANCE_API_SECRET"),
-            tld=("us" if USE_US else "com"),
-            testnet=TESTNET,
-        )
-        twm.start()
-        _ws["twm"] = twm
-    except Exception as e:
-        _ws["err"] = f"twm.start: {e}"
-        _ws["twm"] = None
-        _ws["running"] = False
-        return jsonify(ok=False, error=_ws["err"]), 500
-
-    lim_ms = int(time.time() * 1000)
-
     def _on_kline(msg):
         try:
             if msg.get("e") != "kline":
@@ -2085,22 +1859,6 @@ def _ws_start_view():
         return jsonify(ok=False, error=_ws["err"]), 500
 
     return jsonify(ok=True, running=True)
-
-def _ws_status_view():
-    if not require_admin():
-        return jsonify(ok=False, error="auth"), 401
-    itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
-    syms = list(globals().get("AUTO_SYMBOLS", ["BTCUSDT"]))
-    out = {}
-    now_ms = int(time.time() * 1000)
-    for s in syms:
-        k = _ws_key(s, itv)
-        last = _ws["last_evt_ms"].get(k)
-        out[k] = {
-            "bars": len(_ws["cache"].get(k, [])),
-            "last_age_sec": None if last is None else max(0, (now_ms - int(last)) // 1000),
-        }
-    return jsonify(ok=True, running=_ws.get("running", False), err=_ws.get("err"), status=out)
 
 def _ws_stop_view():
     if not require_admin():
@@ -2226,12 +1984,9 @@ def _ws_status_view():
         return jsonify(ok=False, error="auth"), 401
 
     now_ms = int(time.time() * 1000)
-    itv = AUTO_INTERVAL
-    status = {}
-
-    # Show one entry per configured symbol+interval
+    iitv = str(AUTO_INTERVAL).lower()
     for s in AUTO_SYMBOLS:
-        key = f"{s}:{itv}"
+        key = f"{s.upper()}:{itv}"   # or: key = _ws_key(s, itv) if you keep that helper
         buf = _ws["streams"].get(key)
         bars = (len(buf) if buf else 0)
         last_ms = _ws["last"].get(key)
