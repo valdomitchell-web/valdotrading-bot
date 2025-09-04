@@ -481,7 +481,7 @@ if not _ws.get("running"):
         _ws["err"] = f"ws-restart: {e}"
         _ws["running"] = False
         _ws["twm"] = None
-    return
+return
 
     # If running, check for staleness; restart if everything is stale
     try:
