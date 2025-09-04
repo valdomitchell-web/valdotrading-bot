@@ -1785,6 +1785,149 @@ def _auto_config_view():
 
 _register("/auto/config", "auto_config", ["GET","POST"], _auto_config_view)
 
+# --- WS state ---
+try:
+    _ws
+except NameError:
+    _ws = {"twm": None, "streams": {}, "last": {}, "running": False, "err": None}
+
+def _ws_start_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+
+    if not WS_KLINES_ENABLED:
+        return jsonify(ok=False, error="WS_KLINES_ENABLED=false"), 400
+
+    # already running?
+    if _ws.get("running") and _ws.get("twm"):
+        return jsonify(ok=True, running=True, already=True)
+
+    # init per-symbol buffers
+    itv = AUTO_INTERVAL
+    lim = int(WS_KLINE_LIMIT or 240)
+    for s in AUTO_SYMBOLS:
+        _ws["streams"][f"{s}:{itv}"] = deque(maxlen=lim)
+
+    # import TWM (handle package variations)
+    twm_cls = None
+    err = None
+    try:
+        from binance import ThreadedWebsocketManager as _TWM
+        twm_cls = _TWM
+    except Exception as e:
+        err = e
+        try:
+            from binance.streams import ThreadedWebsocketManager as _TWM
+            twm_cls = _TWM
+        except Exception as e2:
+            err = e2
+
+    if not twm_cls:
+        _ws["err"] = f"ThreadedWebsocketManager not available: {err}"
+        return jsonify(ok=False, error=_ws["err"]), 500
+
+    # start the manager
+    try:
+        twm = twm_cls(
+            api_key=os.getenv("BINANCE_API_KEY"),
+            api_secret=os.getenv("BINANCE_API_SECRET"),
+            tld=("us" if USE_US else "com"),
+            testnet=TESTNET,
+        )
+        twm.start()
+        _ws["twm"] = twm
+    except Exception as e:
+        _ws["err"] = f"twm.start: {e}"
+        _ws["twm"] = None
+        _ws["running"] = False
+        return jsonify(ok=False, error=_ws["err"]), 500
+
+    lim_ms = int(time.time() * 1000)
+
+    def _on_kline(msg):
+        try:
+            if msg.get("e") != "kline":
+                return
+            k = msg["k"]
+            sym = msg["s"]       # e.g. 'BTCUSDT'
+            iv  = k["i"]         # e.g. '30m'
+            key = f"{sym}:{iv}"
+
+            # normalize to "REST-like" bar
+            bar = [
+                int(k["t"]),                      # open time
+                float(k["o"]), float(k["h"]),
+                float(k["l"]), float(k["c"]),     # o,h,l,c
+                float(k.get("v", 0.0)),           # volume
+                int(k["T"]),                      # close time
+            ]
+
+            buf = _ws["streams"].get(key)
+            if buf is None:
+                buf = deque(maxlen=lim)
+                _ws["streams"][key] = buf
+
+            # upsert last bar by open-time
+            if buf and buf[-1][0] == bar[0]:
+                buf[-1] = bar
+            else:
+                buf.append(bar)
+
+            _ws["last"][key] = int(time.time() * 1000)
+        except Exception as e:
+            _ws["err"] = f"ws-cb: {e}"
+
+    # subscribe one kline stream per symbol
+    try:
+        for s in AUTO_SYMBOLS:
+            _ws["twm"].start_kline_socket(
+                callback=_on_kline,
+                symbol=s.lower(),
+                interval=AUTO_INTERVAL
+            )
+        _ws["running"] = True
+        _ws["err"] = None
+    except Exception as e:
+        _ws["err"] = f"subscribe: {e}"
+        _ws["running"] = False
+        try:
+            _ws["twm"].stop()
+        except Exception:
+            pass
+        _ws["twm"] = None
+        return jsonify(ok=False, error=_ws["err"]), 500
+
+    return jsonify(ok=True, running=True)
+
+def _ws_status_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+
+    now_ms = int(time.time() * 1000)
+    itv = AUTO_INTERVAL
+    status = {}
+    for s in AUTO_SYMBOLS:
+        key = f"{s}:{itv}"
+        buf = _ws["streams"].get(key)
+        bars = len(buf) if buf else 0
+        last_ms = _ws["last"].get(key)
+        last_age_sec = round((now_ms - last_ms) / 1000.0, 1) if last_ms else None
+        status[key] = {"bars": bars, "last_age_sec": last_age_sec}
+
+    return jsonify(ok=True, running=bool(_ws.get("running")), err=_ws.get("err"), status=status)
+
+def _ws_stop_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    try:
+        if _ws.get("twm"):
+            _ws["twm"].stop()
+    except Exception:
+        pass
+    _ws["twm"] = None
+    _ws["running"] = False
+    return jsonify(ok=True, running=False, err=_ws.get("err"))
+
 # --- views (plain functions) ---
 def _auto_status_view():
     return jsonify(
@@ -2011,6 +2154,9 @@ _register("/trail/delete",    "trail_overrides_delete_v2", ["POST"], _trail_over
 
 _register("/panic/hedge",   "panic_hedge_v2",   ["POST"], _panic_hedge_view)
 _register("/panic/clear",   "panic_clear_v2",   ["POST"], _panic_clear_view)
+_register("/ws/start",  "ws_start",  ["POST"], _ws_start_view)
+_register("/ws/status", "ws_status", ["GET"],  _ws_status_view)
+_register("/ws/stop",   "ws_stop",   ["POST"], _ws_stop_view)
 
 def _auto_step_view():
     if not require_admin():
