@@ -479,14 +479,20 @@ def _ensure_stream(symbol, interval):
     return _ws["streams"][key]
 
 def _on_kline(msg):
-    # Called by python-binance TWM
     try:
-        if not msg or msg.get("e") != "kline":
-            return
-        k = msg.get("k") or {}
-        sym = (msg.get("s") or "").upper()
-        interval = k.get("i") or AUTO_INTERVAL
-        key = _ws_key(sym, interval)
+        k = msg.get('k') or {}
+        # event time (ms) is in msg['E']; kline close time in k['T'] (ms). Use 'E' for “freshness”.
+        evt_ms = msg.get('E') or k.get('T')
+        key = f"{k.get('s','').upper()}:{k.get('i','').lower()}"  # e.g., "LINKUSDT:30m"
+
+        # update ring buffer …
+        _ws['bufs'][key].append( (k['t'], k['o'], k['h'], k['l'], k['c'], k['v'], k['x']) )
+
+        _ws['last_evt_ms'][key] = evt_ms
+        _ws['bars'][key] = len(_ws['bufs'][key])
+
+    except Exception as e:
+        _ws['err'] = f"kline cb: {e}"
 
         # Build REST-shaped kline row (match /api/v3/klines)
         # [ openTime, open, high, low, close, volume, closeTime, qav, trades, takerBase, takerQuote, ignore ]
@@ -1785,6 +1791,13 @@ def _auto_config_view():
 
 _register("/auto/config", "auto_config", ["GET","POST"], _auto_config_view)
 
+# every N ticks, if WS_KLINES_ENABLED but not running, try restart
+if WS_KLINES_ENABLED and not _ws.get("running"):
+    try:
+        start_ws_if_needed()  # your existing function
+    except Exception as e:
+        _ws["err"] = f"ws-restart: {e}"
+
 # --- WS state ---
 try:
     _ws
@@ -1903,16 +1916,11 @@ def _ws_status_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
 
-    now_ms = int(time.time() * 1000)
-    itv = AUTO_INTERVAL
-    status = {}
-    for s in AUTO_SYMBOLS:
-        key = f"{s}:{itv}"
-        buf = _ws["streams"].get(key)
-        bars = len(buf) if buf else 0
-        last_ms = _ws["last"].get(key)
-        last_age_sec = round((now_ms - last_ms) / 1000.0, 1) if last_ms else None
-        status[key] = {"bars": bars, "last_age_sec": last_age_sec}
+    now_ms = int(time.time()*1000)
+    for key in keys:
+        evt = _ws['last_evt_ms'].get(key)
+        last_age = (now_ms - evt)/1000.0 if evt else None
+        out[key] = {"bars": _ws['bars'].get(key, 0), "last_age_sec": round(last_age,1) if last_age is not None else None}
 
     return jsonify(ok=True, running=bool(_ws.get("running")), err=_ws.get("err"), status=status)
 
