@@ -460,6 +460,115 @@ _ws = {
     "last": {},             # key -> last closed kline closeTime (ms)
     "start_attempted": False,
 }
+
+# --- WS helpers (start/stop/supervise) ---------------------------------------
+from collections import defaultdict, deque
+
+# Minimal WS state if you don't already have it
+_ws = globals().get("_ws") or {
+    "twm": None, "running": False, "err": None,
+    "bufs": defaultdict(lambda: deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240)))),
+    "bars": {},                # key -> int
+    "last_evt_ms": {},         # key -> int ms
+    "subs": [],                # list of "SYMBOL:interval"
+}
+
+def _kline_cb_factory(symbol_upper: str):
+    key_prefix = f"{symbol_upper}:"
+    def _on_kline(msg):
+        try:
+            k = msg.get("k") or {}
+            if not k: 
+                return
+            interval = (k.get("i") or "").lower()
+            key = key_prefix + interval           # e.g. "LINKUSDT:30m"
+            # ensure buffer exists with current maxlen
+            _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
+            # store [open time, o,h,l,c,v, isClosed]
+            _ws["bufs"][key].append([
+                k.get("t"), k.get("o"), k.get("h"), k.get("l"),
+                k.get("c"), k.get("v"), k.get("x")
+            ])
+            _ws["bars"][key] = len(_ws["bufs"][key])
+            evt_ms = msg.get("E") or k.get("T")
+            if evt_ms is not None:
+                _ws["last_evt_ms"][key] = int(evt_ms)
+        except Exception as e:
+            _ws["err"] = f"kline cb: {e}"
+    return _on_kline
+
+def start_ws_if_needed():
+    """
+    Start kline sockets for AUTO_SYMBOLS if not running. Safe to call repeatedly.
+    """
+    if not globals().get("WS_KLINES_ENABLED", True):
+        return False
+    if _ws.get("running"):
+        return True
+    try:
+        try:
+            # prefer new location; fallback for older python-binance
+            from binance.streams import ThreadedWebsocketManager as TWM
+        except Exception:
+            from binance import ThreadedWebsocketManager as TWM
+
+        twm = TWM(
+            api_key=os.getenv("BINANCE_API_KEY"),
+            api_secret=os.getenv("BINANCE_API_SECRET"),
+            tld=("us" if globals().get("USE_US") else "com"),
+            testnet=globals().get("TESTNET", False),
+        )
+        twm.start()
+        _ws["twm"] = twm
+        _ws["subs"].clear()
+
+        interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        for sym in globals().get("AUTO_SYMBOLS", ["BTCUSDT"]):
+            sym_uc = str(sym).upper()
+            sym_lc = sym_uc.lower()          # WS requires lowercase symbols
+            cb = _kline_cb_factory(sym_uc)
+            twm.start_kline_socket(callback=cb, symbol=sym_lc, interval=interval)
+            _ws["subs"].append(f"{sym_uc}:{interval}")
+            # pre-create buffer so /ws/status shows key immediately
+            key = f"{sym_uc}:{interval}"
+            _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
+            _ws["bars"].setdefault(key, 0)
+
+        _ws["running"] = True
+        _ws["err"] = None
+        return True
+    except Exception as e:
+        _ws["err"] = f"ws-start: {e}"
+        _ws["running"] = False
+        _ws["twm"] = None
+        return False
+
+def stop_ws():
+    """Stop WS manager if running."""
+    try:
+        twm = _ws.get("twm")
+        if twm:
+            twm.stop()
+    except Exception as e:
+        _ws["err"] = f"ws-stop: {e}"
+    finally:
+        _ws["twm"] = None
+        _ws["running"] = False
+        _ws["subs"].clear()
+
+def ws_supervisor_tick():
+    """
+    Lightweight guardian you can call each outer tick in auto_loop.
+    If WS is enabled but down, try to start it and record any error.
+    """
+    if not globals().get("WS_KLINES_ENABLED", True):
+        return
+    if not _ws.get("running"):
+        try:
+            start_ws_if_needed()
+        except Exception as e:
+            _ws["err"] = f"ws-restart: {e}"
+
 # ============ WebSocket kline cache/manager ============
 import threading
 from collections import deque
@@ -1326,6 +1435,9 @@ def auto_loop():
             pass
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
+            
+            # keep WS alive if enabled
+            ws_supervisor_tick()
 
             # --- balances: cached fetch with 1003 backoff, no 'continue' needed ---
             proceed = True
@@ -1915,14 +2027,20 @@ def _ws_start_view():
 def _ws_status_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-
-    now_ms = int(time.time()*1000)
-    for key in keys:
-        evt = _ws['last_evt_ms'].get(key)
-        last_age = (now_ms - evt)/1000.0 if evt else None
-        out[key] = {"bars": _ws['bars'].get(key, 0), "last_age_sec": round(last_age,1) if last_age is not None else None}
-
-    return jsonify(ok=True, running=bool(_ws.get("running")), err=_ws.get("err"), status=status)
+    try:
+        now_ms = int(time.time() * 1000)
+        out = {}
+        # Show all expected keys (current AUTO_SYMBOLS/interval) plus any active subs
+        interval = str(AUTO_INTERVAL).lower()
+        keys = [f"{s}:{interval}" for s in AUTO_SYMBOLS]
+        keys += [k for k in _ws["bufs"].keys() if k not in keys]
+        for k in keys:
+            evt = _ws["last_evt_ms"].get(k)
+            age = round((now_ms - evt)/1000.0, 1) if evt else None
+            out[k] = {"bars": _ws["bars"].get(k, 0), "last_age_sec": age}
+        return jsonify(ok=True, running=_ws.get("running", False), err=_ws.get("err"), status=out)
+    except Exception as e:
+        return jsonify(ok=False, running=_ws.get("running", False), err=str(e))
 
 def _ws_stop_view():
     if not require_admin():
