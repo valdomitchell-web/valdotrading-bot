@@ -596,7 +596,7 @@ def ws_supervisor_tick():
         try:
             start_ws_if_needed()
         except Exception as e:
-            _ws["err"] = f"ws-restart: {e}"}"
+            _ws["err"] = f"ws-restart: {e}
 
 # ============ WebSocket kline cache/manager ============
 import threading
