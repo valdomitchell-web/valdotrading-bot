@@ -450,6 +450,9 @@ RETRY_BACKOFF_SEC   = float(os.getenv("RETRY_BACKOFF_SEC", "1.5"))
 WS_KLINES_ENABLED = env_true("WS_KLINES_ENABLED", "true")
 WS_STALE_SEC      = int(os.getenv("WS_STALE_SEC", "60"))
 WS_KLINE_LIMIT    = int(os.getenv("WS_KLINE_LIMIT", "240"))
+# Config (feel free to expose these via /auto/config later)
+WS_SEED_ON_START = globals().get("WS_SEED_ON_START", True)     # seed buffers once on start
+WS_SEED_LIMIT    = int(globals().get("WS_SEED_LIMIT", 8))      # tiny to keep REST weight minimal
 
 # central WS state
 _ws = {
@@ -473,18 +476,26 @@ _ws = globals().get("_ws") or {
     "subs": [],                # list of "SYMBOL:interval"
 }
 
+# Ensure _ws has all keys no matter prior state
+_ws = globals().get("_ws") or {}
+_ws.setdefault("twm", None)
+_ws.setdefault("running", False)
+_ws.setdefault("err", None)
+_ws.setdefault("subs", [])                                    # <— fixes 'subs' KeyError
+_ws.setdefault("bufs", defaultdict(lambda: deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240)))))
+_ws.setdefault("bars", {})
+_ws.setdefault("last_evt_ms", {})
+
 def _kline_cb_factory(symbol_upper: str):
     key_prefix = f"{symbol_upper}:"
     def _on_kline(msg):
         try:
             k = msg.get("k") or {}
-            if not k: 
+            if not k:
                 return
             interval = (k.get("i") or "").lower()
-            key = key_prefix + interval           # e.g. "LINKUSDT:30m"
-            # ensure buffer exists with current maxlen
+            key = key_prefix + interval
             _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
-            # store [open time, o,h,l,c,v, isClosed]
             _ws["bufs"][key].append([
                 k.get("t"), k.get("o"), k.get("h"), k.get("l"),
                 k.get("c"), k.get("v"), k.get("x")
@@ -497,17 +508,37 @@ def _kline_cb_factory(symbol_upper: str):
             _ws["err"] = f"kline cb: {e}"
     return _on_kline
 
+def _seed_ws_buffers_once():
+    """Seed each symbol's buffer once via REST so bars > 0 immediately."""
+    if not WS_SEED_ON_START:
+        return
+    try:
+        client = make_client()
+        interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        for sym in globals().get("AUTO_SYMBOLS", ["BTCUSDT"]):
+            key = f"{sym}:{interval}"
+            if _ws["bars"].get(key, 0) > 0:
+                continue
+            kl = client.get_klines(symbol=sym, interval=interval, limit=WS_SEED_LIMIT)
+            if not kl:
+                continue
+            dq = _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
+            dq.clear()
+            for r in kl:
+                # r = [open_time, open, high, low, close, volume, close_time, ...]
+                dq.append([r[0], str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5]), True])
+            _ws["bars"][key] = len(dq)
+            _ws["last_evt_ms"][key] = int(kl[-1][6])  # use close_time as last event
+    except Exception as e:
+        _ws["err"] = f"ws-seed: {e}"
+
 def start_ws_if_needed():
-    """
-    Start kline sockets for AUTO_SYMBOLS if not running. Safe to call repeatedly.
-    """
     if not globals().get("WS_KLINES_ENABLED", True):
         return False
     if _ws.get("running"):
         return True
     try:
         try:
-            # prefer new location; fallback for older python-binance
             from binance.streams import ThreadedWebsocketManager as TWM
         except Exception:
             from binance import ThreadedWebsocketManager as TWM
@@ -525,14 +556,17 @@ def start_ws_if_needed():
         interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
         for sym in globals().get("AUTO_SYMBOLS", ["BTCUSDT"]):
             sym_uc = str(sym).upper()
-            sym_lc = sym_uc.lower()          # WS requires lowercase symbols
+            sym_lc = sym_uc.lower()
             cb = _kline_cb_factory(sym_uc)
-            twm.start_kline_socket(callback=cb, symbol=sym_lc, interval=interval)
+            # param names vary by version; be explicit
+            twm.start_kline_socket(symbol=sym_lc, interval=interval, callback=cb)
             _ws["subs"].append(f"{sym_uc}:{interval}")
-            # pre-create buffer so /ws/status shows key immediately
             key = f"{sym_uc}:{interval}"
             _ws["bufs"].setdefault(key, deque(maxlen=int(globals().get("WS_KLINE_LIMIT", 240))))
             _ws["bars"].setdefault(key, 0)
+
+        # one-time seed so bars > 0 right after start
+        _seed_ws_buffers_once()
 
         _ws["running"] = True
         _ws["err"] = None
@@ -544,7 +578,6 @@ def start_ws_if_needed():
         return False
 
 def stop_ws():
-    """Stop WS manager if running."""
     try:
         twm = _ws.get("twm")
         if twm:
@@ -557,17 +590,13 @@ def stop_ws():
         _ws["subs"].clear()
 
 def ws_supervisor_tick():
-    """
-    Lightweight guardian you can call each outer tick in auto_loop.
-    If WS is enabled but down, try to start it and record any error.
-    """
     if not globals().get("WS_KLINES_ENABLED", True):
         return
     if not _ws.get("running"):
         try:
             start_ws_if_needed()
         except Exception as e:
-            _ws["err"] = f"ws-restart: {e}"
+            _ws["err"] = f"ws-restart: {e}"}"
 
 # ============ WebSocket kline cache/manager ============
 import threading
@@ -1503,6 +1532,7 @@ def auto_loop():
 
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
+            ws_supervisor_tick()
 
             # ... your balances / proceed logic above ...
 
@@ -2029,16 +2059,16 @@ def _ws_status_view():
         return jsonify(ok=False, error="auth"), 401
     try:
         now_ms = int(time.time() * 1000)
-        out = {}
-        # Show all expected keys (current AUTO_SYMBOLS/interval) plus any active subs
         interval = str(AUTO_INTERVAL).lower()
         keys = [f"{s}:{interval}" for s in AUTO_SYMBOLS]
         keys += [k for k in _ws["bufs"].keys() if k not in keys]
+        out = {}
         for k in keys:
             evt = _ws["last_evt_ms"].get(k)
             age = round((now_ms - evt)/1000.0, 1) if evt else None
             out[k] = {"bars": _ws["bars"].get(k, 0), "last_age_sec": age}
-        return jsonify(ok=True, running=_ws.get("running", False), err=_ws.get("err"), status=out)
+        return jsonify(ok=True, running=_ws.get("running", False), err=_ws.get("err"),
+                       status=out, subs=list(_ws.get("subs", [])))
     except Exception as e:
         return jsonify(ok=False, running=_ws.get("running", False), err=str(e))
 
