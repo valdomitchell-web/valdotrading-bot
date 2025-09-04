@@ -457,45 +457,54 @@ WS_SEED_LIMIT    = int(globals().get("WS_SEED_LIMIT", 8))      # tiny to keep RE
 # --- WS helpers (start/stop/supervise) ---------------------------------------
 from collections import defaultdict, deque
 
-# central WS state
-_ws = {
-    "twm": None,
-    "running": False,
-    "err": None,
-    "streams": {},          # key = f"{symbol}:{interval}" -> deque of REST-shaped klines
-    "last": {},             # key -> last closed kline closeTime (ms)
-    "start_attempted": False,
-}
-
-# Ensure _ws has all keys no matter prior state
+# central WS state (idempotent init)
 _ws = globals().get("_ws") or {}
 _ws.setdefault("twm", None)
 _ws.setdefault("running", False)
 _ws.setdefault("err", None)
+_ws.setdefault("streams", {})          # key = "SYMBOL:interval" -> deque([...])
+_ws.setdefault("last", {})             # optional: last closed kline closeTime (ms)
+_ws.setdefault("last_evt_ms", {})      # last WS event time per key (ms)
+_ws.setdefault("start_attempted", False)
 
-# If not running, try to (re)start
-if not _ws.get("running"):
+def ws_supervisor_tick():
+    """
+    Keep the kline websockets healthy:
+    - If disabled, no-op
+    - If not running, try to start
+    - If running but all streams are stale for > WS_STALE_SEC, bounce/restart
+    """
+    if not globals().get("WS_KLINES_ENABLED", True):
+        return
+
+    # not running? try to (re)start
+    if not _ws.get("running"):
+        try:
+            start_ws_if_needed()
+        except Exception as e:
+            _ws["err"] = f"ws-restart: {e}"
+            _ws["running"] = False
+            _ws["twm"] = None
+        return
+
+    # running: check freshness
     try:
-        start_ws_if_needed()
-    except Exception as e:
-        _ws["err"] = f"ws-restart: {e}"
-        _ws["running"] = False
-        _ws["twm"] = None
-return
+        try:
+            stale_sec = int(globals().get("WS_STALE_SEC", 12))
+        except Exception:
+            stale_sec = 12
 
-# If running, check for staleness; restart if everything is stale
-try:
-    stale_sec = int(globals().get("WS_STALE_SEC", 12))
-    interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
-    keys = [f"{s}:{interval}" for s in globals().get("AUTO_SYMBOLS", ["BTCUSDT"])]
+        itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        keys = [f"{str(s).upper()}:{itv}" for s in globals().get("AUTO_SYMBOLS", ["BTCUSDT"])]
 
-    now_ms = int(time.time() * 1000)
-    any_fresh = False
-    for k in keys:
-        evt = _ws["last_evt_ms"].get(k)
-        if evt and (now_ms - int(evt) <= stale_sec * 1000):
-            any_fresh = True
-            break
+        now_ms = int(time.time() * 1000)
+        last_map = _ws.get("last_evt_ms", {})
+        any_fresh = False
+        for k in keys:
+            evt = last_map.get(k)
+            if evt and (now_ms - int(evt) <= stale_sec * 1000):
+                any_fresh = True
+                break
 
         if not any_fresh:
             # everything looks stale — bounce the sockets
