@@ -1847,7 +1847,7 @@ except NameError:
         except Exception:
             pass
         _ws["twm"] = None
-        return jsonify(ok=False, error=_ws["err"]), 500
+    return jsonify(ok=False, error=_ws["err"]), 500
 
     return jsonify(ok=True, running=True)
 
