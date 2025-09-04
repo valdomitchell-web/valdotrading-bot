@@ -662,7 +662,7 @@ def ws_start_kline_stream(symbols=None, interval=None):
         for s in syms:
             twm.start_kline_socket(callback=_on_kline, symbol=s, interval=itv)
 
-                _ws["twm"] = twm
+        _ws["twm"] = twm
         _ws["running"] = True
         _ws["err"] = None
         _ws["start_attempted"] = True
