@@ -483,19 +483,19 @@ if not _ws.get("running"):
         _ws["twm"] = None
 return
 
-    # If running, check for staleness; restart if everything is stale
-    try:
-        stale_sec = int(globals().get("WS_STALE_SEC", 12))
-        interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
-        keys = [f"{s}:{interval}" for s in globals().get("AUTO_SYMBOLS", ["BTCUSDT"])]
+# If running, check for staleness; restart if everything is stale
+try:
+    stale_sec = int(globals().get("WS_STALE_SEC", 12))
+    interval = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+    keys = [f"{s}:{interval}" for s in globals().get("AUTO_SYMBOLS", ["BTCUSDT"])]
 
-        now_ms = int(time.time() * 1000)
-        any_fresh = False
-        for k in keys:
-            evt = _ws["last_evt_ms"].get(k)
-            if evt and (now_ms - int(evt) <= stale_sec * 1000):
-                any_fresh = True
-                break
+    now_ms = int(time.time() * 1000)
+    any_fresh = False
+    for k in keys:
+        evt = _ws["last_evt_ms"].get(k)
+        if evt and (now_ms - int(evt) <= stale_sec * 1000):
+            any_fresh = True
+            break
 
         if not any_fresh:
             # everything looks stale — bounce the sockets
