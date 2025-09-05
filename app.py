@@ -883,6 +883,153 @@ def schedule_allows_now_utc() -> bool:
             return True
     return False
 
+# ---------- SETTINGS SNAPSHOT / RESTORE ----------
+# requires: Setting model + setting_get/setting_set, _register, require_admin,
+#           _as_config_dict(), persist_overrides(), ensure_trail_state(), get_open_long_avg_price()
+
+import json
+
+def _apply_config_updates(cfg: dict) -> dict:
+    """Apply a subset of /auto/config keys from a dict. Returns {updated}."""
+    if not isinstance(cfg, dict):
+        return {}
+    updated = {}
+
+    def _coerce_bool(v):
+        if isinstance(v, bool): return v
+        return str(v).strip().lower() in ("1","true","yes","y","on")
+
+    bool_keys  = ["ENABLE_TPSL","ENABLE_TRAILING","ALLOW_TREND_ENTRY","ALLOW_TREND_EXIT","DYN_RISK","WS_KLINES_ENABLED"]
+    float_keys = [
+        "TP_PCT","SL_PCT","TRAIL_ARM_PCT","TRAIL_PCT","PANIC_RSI_BTC","PANIC_RSI_ETH",
+        "BUY_RSI_MAX","SELL_RSI_MIN","EMA_SEP_BPS","AUTO_RISK_USDT","PER_SYMBOL_MAX_USDT",
+        "ATR_MIN_PCT","ATR_MAX_PCT","DYN_RISK_MULT","DYN_RISK_MIN_USDT","DYN_RISK_MAX_USDT",
+        "PORTFOLIO_MAX_USDT"
+    ]
+    int_keys   = [
+        "EMA_FAST","EMA_SLOW","RSI_LEN","AUTO_COOLDOWN_SEC","AUTO_MAX_BUYS_PER_MIN",
+        "CROSS_CONFIRM_BARS","ATR_LEN","KL_LIMIT","ACCOUNT_REFRESH_N","BACKOFF_1003_SEC",
+        "AUTO_POLL_SEC","DECISIONS_MAX","WS_STALE_SEC","WS_KLINE_LIMIT",
+        "MAX_LOSS_STREAK","LOSS_COOLDOWN_SEC"
+    ]
+    str_keys   = ["PANIC_MODE","AUTO_INTERVAL","TIME_WINDOWS_UTC"]
+
+    # scalars
+    for k in bool_keys:
+        if k in cfg:
+            globals()[k] = _coerce_bool(cfg[k]); updated[k] = globals()[k]
+    for k in float_keys:
+        if k in cfg:
+            try:
+                globals()[k] = float(cfg[k]); updated[k] = globals()[k]
+            except Exception: pass
+    for k in int_keys:
+        if k in cfg:
+            try:
+                globals()[k] = int(cfg[k]); updated[k] = globals()[k]
+            except Exception: pass
+    for k in str_keys:
+        if k in cfg:
+            globals()[k] = str(cfg[k]); updated[k] = globals()[k]
+
+    # lists / special
+    if "AUTO_SYMBOLS" in cfg:
+        if isinstance(cfg["AUTO_SYMBOLS"], list):
+            AUTO_SYMBOLS[:] = [str(s).upper() for s in cfg["AUTO_SYMBOLS"]]
+        else:
+            AUTO_SYMBOLS[:] = [s.strip().upper() for s in str(cfg["AUTO_SYMBOLS"]).split(",") if s.strip()]
+        updated["AUTO_SYMBOLS"] = AUTO_SYMBOLS
+
+    if "AUTO_ENABLED" in cfg:
+        _auto["enabled"] = _coerce_bool(cfg["AUTO_ENABLED"])
+        updated["AUTO_ENABLED"] = _auto["enabled"]
+
+    if "PANIC_ARMED" in cfg:
+        _auto["panic_armed"] = _coerce_bool(cfg["PANIC_ARMED"])
+        updated["PANIC_ARMED"] = _auto["panic_armed"]
+
+    # guardrails
+    if "TP_PCT" in updated and TP_PCT < 0: globals()["TP_PCT"] = 0.0
+    if "SL_PCT" in updated and SL_PCT < 0: globals()["SL_PCT"] = 0.0
+    if "TRAIL_PCT" in updated and TRAIL_PCT < 0: globals()["TRAIL_PCT"] = 0.0
+
+    # recompute schedule if changed
+    if "TIME_WINDOWS_UTC" in cfg:
+        globals()["_SCHED_WINS"] = _parse_windows(TIME_WINDOWS_UTC)
+
+    return updated
+
+
+def _settings_export_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    try:
+        # dump settings table
+        rows = Setting.query.all()
+        settings_dump = {r.key: json.loads(r.value_json) for r in rows}
+
+        # include running config + overrides for one-stop snapshot
+        snap = dict(
+            settings=settings_dump,
+            config=_as_config_dict(),
+            overrides=_auto.get("overrides", {}),
+            ts=datetime.utcnow().isoformat()
+        )
+        return jsonify(ok=True, snapshot=snap)
+    except Exception as e:
+        return jsonify(ok=False, error=f"export: {e}"), 500
+
+
+def _settings_import_view():
+    if not require_admin():
+        return jsonify(ok=False, error="auth"), 401
+    data = request.get_json(silent=True) or {}
+    applied = {"settings": 0, "config": {}, "overrides": False}
+    try:
+        # 1) arbitrary settings rows
+        if isinstance(data.get("settings"), dict):
+            for k, v in data["settings"].items():
+                try:
+                    setting_set(str(k), v)
+                    applied["settings"] += 1
+                except Exception:
+                    pass
+
+        # 2) config (same keys as /auto/config)
+        if isinstance(data.get("config"), dict):
+            applied["config"] = _apply_config_updates(data["config"])
+
+        # 3) per-symbol overrides (and persist)
+        if isinstance(data.get("overrides"), dict):
+            _auto["overrides"] = {}
+            # normalize symbols -> UPPER
+            for sym, ov in data["overrides"].items():
+                if not isinstance(ov, dict): continue
+                s = (sym or "").upper().strip()
+                if not s: continue
+                _auto["overrides"][s] = dict(ov)
+                # refresh trail state off current avg
+                try:
+                    avg = get_open_long_avg_price(s) or 0.0
+                    ensure_trail_state(s, float(avg))
+                except Exception:
+                    pass
+            try:
+                persist_overrides()
+                applied["overrides"] = True
+            except Exception:
+                applied["overrides"] = False
+
+        return jsonify(ok=True, applied=applied, config=_as_config_dict(), overrides=_auto.get("overrides", {}))
+    except Exception as e:
+        return jsonify(ok=False, error=f"import: {e}"), 500
+
+
+# bind routes
+_register("/settings/export", "settings_export", ["GET"],  _settings_export_view)
+_register("/settings/import", "settings_import", ["POST"], _settings_import_view)
+# ---------- end snapshot/restore ----------
+
 def new_coid(prefix: str, sym: str) -> str:
     # short, unique clientOrderId to dedup exchange retries
     return f"{prefix}-{sym}-{int(time.time()*1000)%10_000_000_000}"
