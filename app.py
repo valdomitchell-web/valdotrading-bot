@@ -1948,33 +1948,39 @@ _register("/auto/mode", "auto_mode", ["GET","POST"], _auto_mode_view)
 def _ws_start_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-    # seed buffers with a few recent bars so status/step have data immediately
+
+    # Seed buffers with a few recent bars so status/step have data immediately
     try:
         seed_lim = 8
         c = make_client()
         itv = str(AUTO_INTERVAL).lower()
         lim = int(WS_KLINE_LIMIT or 240)
 
-    for s in AUTO_SYMBOLS:
-        key = f"{s}:{itv}"
-        buf = _ws["streams"].get(key)
-        if buf is None:
-            buf = deque(maxlen=lim)
-            _ws["streams"][key] = buf
-        # only seed if empty
-        if len(buf) == 0:
-            try:
-                kl = c.get_klines(symbol=s, interval=itv, limit=seed_lim)
-                for r in kl:
-                    # [open_time, o, h, l, c, v, close_time]
-                    buf.append([int(r[0]), float(r[1]), float(r[2]),
-                                float(r[3]), float(r[4]), float(r[5]), int(r[6])])
-                if kl:
-                    _ws["last"][key] = int(kl[-1][6])
-            except Exception:
-                pass
-except Exception as _seed_err:
-    _ws["err"] = f"ws-seed: {_seed_err}"    
+        for s in AUTO_SYMBOLS:
+            key = f"{s}:{itv}"
+            buf = _ws["streams"].get(key)
+            if buf is None:
+                buf = deque(maxlen=lim)
+                _ws["streams"][key] = buf
+            # only seed if empty
+            if len(buf) == 0:
+                try:
+                    kl = c.get_klines(symbol=s, interval=itv, limit=seed_lim)
+                    for r in kl:
+                        # [open_time, o, h, l, c, v, close_time]
+                        buf.append([
+                            int(r[0]), float(r[1]), float(r[2]),
+                            float(r[3]), float(r[4]), float(r[5]), int(r[6])
+                        ])
+                    if kl:
+                        _ws["last"][key] = int(kl[-1][6])
+                except Exception:
+                    # seeding is best-effort; ignore per-symbol failures
+                    pass
+    except Exception as _seed_err:
+        _ws["err"] = f"ws-seed: {_seed_err}"
+
+    # Now start the kline sockets
     ok = ws_start_kline_stream(AUTO_SYMBOLS, AUTO_INTERVAL)
     return jsonify(ok=bool(ok), running=_ws.get("running"), err=_ws.get("err"))
 
