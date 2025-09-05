@@ -1948,6 +1948,33 @@ _register("/auto/mode", "auto_mode", ["GET","POST"], _auto_mode_view)
 def _ws_start_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
+    # seed buffers with a few recent bars so status/step have data immediately
+    try:
+        seed_lim = 8
+        c = make_client()
+        itv = str(AUTO_INTERVAL).lower()
+        lim = int(WS_KLINE_LIMIT or 240)
+
+        for s in AUTO_SYMBOLS:
+        key = f"{s}:{itv}"
+        buf = _ws["streams"].get(key)
+        if buf is None:
+            buf = deque(maxlen=lim)
+            _ws["streams"][key] = buf
+        # only seed if empty
+        if len(buf) == 0:
+            try:
+                kl = c.get_klines(symbol=s, interval=itv, limit=seed_lim)
+                for r in kl:
+                    # [open_time, o, h, l, c, v, close_time]
+                    buf.append([int(r[0]), float(r[1]), float(r[2]),
+                                float(r[3]), float(r[4]), float(r[5]), int(r[6])])
+                if kl:
+                    _ws["last"][key] = int(kl[-1][6])
+            except Exception:
+                pass
+except Exception as _seed_err:
+    _ws["err"] = f"ws-seed: {_seed_err}"    
     ok = ws_start_kline_stream(AUTO_SYMBOLS, AUTO_INTERVAL)
     return jsonify(ok=bool(ok), running=_ws.get("running"), err=_ws.get("err"))
 
@@ -2097,8 +2124,20 @@ def _auto_step_view():
         try:
             # ---- data fetch ----
             kl = get_klines_any(client, sym, AUTO_INTERVAL, 120)
-            if not kl:
-                items.append({"symbol": sym, "error": "no klines"})
+            # need enough bars for EMA/RSI/ATR
+            ATR_LEN_SAFE     = int(globals().get("ATR_LEN", 14))
+            kl_needed = max(EMA_SLOW, RSI_LEN, ATR_LEN_SAFE) + 2
+
+            # if WS had only a few bars, fall back to REST to avoid index errors
+            if not kl or len(kl) < kl_needed:
+                try:
+                    kl = client.get_klines(symbol=sym, interval=AUTO_INTERVAL, limit=max(kl_needed, 120))
+                except Exception as _e:
+                    items.append({"symbol": sym, "error": f"no/few klines ({_e})"})
+                    continue
+
+            if not kl or len(kl) < kl_needed:
+                items.append({"symbol": sym, "error": f"few-bars: {len(kl) if kl else 0} < {kl_needed}"})
                 continue
 
             closes = [float(k[4]) for k in kl]
