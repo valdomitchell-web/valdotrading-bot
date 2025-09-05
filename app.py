@@ -1783,13 +1783,6 @@ def _auto_config_view():
 
 _register("/auto/config", "auto_config", ["GET","POST"], _auto_config_view)
 
-# every N ticks, if WS_KLINES_ENABLED but not running, try restart
-if WS_KLINES_ENABLED and not _ws.get("running"):
-    try:
-        start_ws_if_needed()  # your existing function
-    except Exception as e:
-        _ws["err"] = f"ws-restart: {e}"
-
 # --- WS state ---
 try:
     _ws
@@ -1973,7 +1966,7 @@ def _ws_start_view():
                             float(r[3]), float(r[4]), float(r[5]), int(r[6])
                         ])
                     if kl:
-                        _ws["last"][key] = int(kl[-1][6])
+                        _ws["last"][key] = int(time.time() * 1000)
                 except Exception:
                     # seeding is best-effort; ignore per-symbol failures
                     pass
@@ -1997,7 +1990,7 @@ def _ws_status_view():
         buf = _ws["streams"].get(key)
         bars = len(buf) if buf else 0
         last_ms = _ws["last"].get(key)
-        last_age_sec = (round((now_ms - last_ms) / 1000.0, 1) if last_ms else None)
+        last_age_sec = (round(max(0, now_ms - last_ms) / 1000.0, 1) if last_ms else None)
         status[key] = {"bars": bars, "last_age_sec": last_age_sec}
 
     return jsonify(ok=True, running=bool(_ws.get("running")), err=_ws.get("err"), status=status)
