@@ -682,26 +682,29 @@ def get_klines_cached(symbol, interval, limit):
     return list(buf)[-limit:]
 
 def get_klines_any(client, symbol, interval, limit):
-    """Prefer WS cache; start it lazily if enabled, else fall back to REST."""
-    # lazy start (one-shot) so /auto/step works even when auto_loop isn't running
-    if WS_KLINES_ENABLED and not _ws.get("running") and not _ws.get("start_attempted"):
-        _ws["start_attempted"] = True
-        try:
-            ws_start_kline_stream([symbol] if symbol else None, interval)
-        except Exception as ex:
-            _ws["err"] = f"lazy-start: {ex}"
-    sym_uc = str(symbol).upper()
-    itv    = str(interval).lower()
+    # Prefer WS cache only if it's fresh for this symbol
+    key = f"{symbol}:{interval}"
+    now_ms = int(time.time() * 1000)
+    last_ms = _ws["last"].get(key)
 
-    rows = get_klines_cached(sym_uc, itv, limit)
-    if rows:
-        return rows
-    return client.get_klines(symbol=sym_uc, interval=itv, limit=limit)
+    use_ws = (
+        WS_KLINES_ENABLED
+        and _ws.get("running")
+        and last_ms is not None
+        and (now_ms - int(last_ms)) <= int(WS_STALE_SEC) * 1000
+    )
 
+    if use_ws:
+        rows = get_klines_cached(symbol, interval, limit)
+        if rows:
+            return rows
+
+    # Fallback to REST (or if WS not fresh)
     try:
         return client.get_klines(symbol=symbol, interval=interval, limit=limit)
     except Exception:
         return None
+
 # ========== end WebSocket kline cache/manager ==========
 
 # --- ensure DECISIONS exists (near the top, after deque import) ---
