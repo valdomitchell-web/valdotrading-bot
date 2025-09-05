@@ -1026,8 +1026,8 @@ def _settings_import_view():
 
 
 # bind routes
-_register("/settings/export", "settings_export", ["GET"],  _settings_export_view)
-_register("/settings/import", "settings_import", ["POST"], _settings_import_view)
+#_register("/settings/export", "settings_export", ["GET"],  _settings_export_view)
+#_register("/settings/import", "settings_import", ["POST"], _settings_import_view)
 # ---------- end snapshot/restore ----------
 
 def new_coid(prefix: str, sym: str) -> str:
@@ -2505,7 +2505,8 @@ _register("/auto/stop",      "auto_stop_v2",      ["POST"], _auto_stop_view)
 _register("/auto/decisions", "auto_decisions_v2", ["GET"],  _auto_decisions_view)
 _register("/auto/step",      "auto_step_v2",      ["GET"],  _auto_step_view)
 _register("/debug/live_buy", "debug_live_buy_v2", ["POST"], _debug_live_buy_view)
-
+_register("/settings/export", "settings_export", ["GET"],  _settings_export_view)
+_register("/settings/import", "settings_import", ["POST"], _settings_import_view)
 # ============== END of auto trader (decoratorless) ==============
 @app.get("/balances_live")
 def balances_live():
