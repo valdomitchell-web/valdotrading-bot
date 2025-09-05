@@ -1955,7 +1955,7 @@ def _ws_start_view():
         itv = str(AUTO_INTERVAL).lower()
         lim = int(WS_KLINE_LIMIT or 240)
 
-        for s in AUTO_SYMBOLS:
+    for s in AUTO_SYMBOLS:
         key = f"{s}:{itv}"
         buf = _ws["streams"].get(key)
         if buf is None:
