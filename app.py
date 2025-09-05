@@ -39,6 +39,40 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')  # e.g. postgr
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+# --- simple key/value settings store ---
+import json
+from datetime import datetime
+
+class Setting(db.Model):
+    __tablename__ = "settings"
+    key        = db.Column(db.String(64), primary_key=True)
+    value_json = db.Column(db.Text, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+def setting_get(key: str, default=None):
+    try:
+        row = Setting.query.get(key)
+        if not row:
+            return default
+        return json.loads(row.value_json)
+    except Exception:
+        return default
+
+def setting_set(key: str, value) -> bool:
+    try:
+        row = Setting.query.get(key)
+        payload = json.dumps(value, separators=(",", ":"))
+        if row:
+            row.value_json = payload
+        else:
+            row = Setting(key=key, value_json=payload, updated_at=datetime.utcnow())
+            db.session.add(row)
+        db.session.commit()
+        return True
+    except Exception:
+        db.session.rollback()
+        return False
+
 load_dotenv(override=False)  # don't override Render env vars with .env
 
 def env_true(name, default="false"):
@@ -680,9 +714,8 @@ def get_klines_cached(symbol, interval, limit):
     if limit is None or limit <= 0:
         return list(buf)
     return list(buf)[-limit:]
-
+    
 def get_klines_any(client, symbol, interval, limit):
-    # Prefer WS cache only if it's fresh for this symbol
     key = f"{symbol}:{interval}"
     now_ms = int(time.time() * 1000)
     last_ms = _ws["last"].get(key)
@@ -699,7 +732,7 @@ def get_klines_any(client, symbol, interval, limit):
         if rows:
             return rows
 
-    # Fallback to REST (or if WS not fresh)
+    # Fallback to REST (symbol-level)
     try:
         return client.get_klines(symbol=symbol, interval=interval, limit=limit)
     except Exception:
@@ -724,6 +757,23 @@ _auto = {
 
 # add a bucket for per-symbol overrides
 _auto.setdefault("overrides", {})   # shape: { "ETHUSDT": { ... } }
+
+SETTINGS_KEY_OVERRIDES = "trail_overrides_v2"
+
+def load_overrides_from_db():
+    data = setting_get(SETTINGS_KEY_OVERRIDES, {})
+    if isinstance(data, dict):
+        _auto["overrides"] = data
+
+def persist_overrides():
+    # best-effort; keep runtime behavior even if DB write fails
+    setting_set(SETTINGS_KEY_OVERRIDES, _auto.get("overrides", {}) or {})
+
+# load once during startup
+try:
+    load_overrides_from_db()
+except Exception:
+    pass
 
 def get_overrides(sym: str) -> dict:
     return (_auto.get("overrides") or {}).get(sym, {}) or {}
@@ -935,7 +985,6 @@ def _trail_overrides_upsert_view():
     if not sym:
         return jsonify(ok=False, error="symbol required"), 400
 
-    # allowed keys
     allowed = {
         "trailing_active": lambda v: bool(v) if isinstance(v, bool) else str(v).lower() in ("1","true","yes","y","on"),
         "trail_arm_pct": float,
@@ -950,24 +999,26 @@ def _trail_overrides_upsert_view():
     for k, coerce in allowed.items():
         if k in data and data[k] is not None:
             try:
-                dest[k] = coerce(data[k])
-                changed[k] = dest[k]
+                dest[k] = coerce(data[k]); changed[k] = dest[k]
             except Exception:
                 pass
 
-    # if we changed trailing knobs, refresh/arm state off current avg
+    # refresh trail state off current avg if needed
     try:
         avg = get_open_long_avg_price(sym) or 0.0
         ensure_trail_state(sym, float(avg))
     except Exception:
         pass
 
+    # persist
+    saved = False
     try:
-        app.logger.info("[TRAIL] overrides upsert for %s: %s", sym, changed)
+        persist_overrides()
+        saved = True
     except Exception:
-        pass
+        saved = False
 
-    return jsonify(ok=True, symbol=sym, overrides=dest, changed=changed)
+    return jsonify(ok=True, symbol=sym, overrides=dest, changed=changed, saved=saved)
 
 def _trail_overrides_delete_view():
     if not require_admin():
@@ -976,11 +1027,16 @@ def _trail_overrides_delete_view():
     sym = (data.get("symbol") or "").upper().strip()
     if not sym:
         return jsonify(ok=False, error="symbol required"), 400
-    ovr = _auto.get("overrides", {})
-    removed = ovr.pop(sym, None)
-    # leaving trailing runtime state intact; optional: also clear it
-    # _auto.get("trails", {}).pop(sym, None)
-    return jsonify(ok=True, symbol=sym, removed=bool(removed), overrides=_auto.get("overrides", {}))
+
+    removed = bool((_auto.get("overrides") or {}).pop(sym, None))
+    saved = False
+    try:
+        persist_overrides()
+        saved = True
+    except Exception:
+        saved = False
+
+    return jsonify(ok=True, symbol=sym, removed=removed, overrides=_auto.get("overrides", {}), saved=saved)
 
 # --- static TP/SL bands ---
 def eval_tpsl_and_maybe_sell(client, symbol: str, price: float, base_bal: float, flt):
@@ -1514,13 +1570,9 @@ def auto_loop():
                             spend = max(float(AUTO_RISK_USDT), float(min_notional))
 
                         try:
-                            o = client.create_order(
-                                symbol=sym,
-                                side="BUY",
-                                type=Client.ORDER_TYPE_MARKET,
-                                quoteOrderQty=f"{spend:.2f}",
-                                recvWindow=10000
-                            )
+                            o = place_market_order(client, sym, "BUY",
+                                                   quoteOrderQty=f"{spend:.2f}", price_hint=price)                              
+                            
                             record_trade_ts(sym)
 
                             fills = o.get("fills") or []
@@ -1562,13 +1614,9 @@ def auto_loop():
                         qty_str = qty_to_str(base_bal, step_str, min_qty_str)
                         if float(qty_str) * price >= min_notional and float(qty_str) > 0:
                             try:
-                                o = client.create_order(
-                                    symbol=sym,
-                                    side="SELL",
-                                    type=Client.ORDER_TYPE_MARKET,
-                                    quantity=qty_str,
-                                    recvWindow=10000
-                                )
+                                o = place_market_order(client, sym, "SELL",
+                                                       qty_str=qty_str, price_hint=price)
+                                    
                                 record_trade_ts(sym)
 
                                 fills = o.get("fills") or []
