@@ -959,56 +959,55 @@ def _apply_config_updates(cfg: dict) -> dict:
 
     return updated
 
-
 def _settings_export_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
     try:
-        # dump settings table
         rows = Setting.query.all()
         settings_dump = {r.key: json.loads(r.value_json) for r in rows}
-
-        # include running config + overrides for one-stop snapshot
         snap = dict(
             settings=settings_dump,
             config=_as_config_dict(),
             overrides=_auto.get("overrides", {}),
             ts=datetime.utcnow().isoformat()
         )
-        return jsonify(ok=True, snapshot=snap)
+        raw = str(request.args.get("raw", "")).lower() in ("1","true","yes","y","on")
+        return (jsonify(ok=True, snapshot=snap) if not raw
+                else jsonify(ok=True, **snap))
     except Exception as e:
         return jsonify(ok=False, error=f"export: {e}"), 500
-
 
 def _settings_import_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
-    data = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True) or {}
+
+    # NEW: accept either raw snapshot *or* {snapshot: ...}
+    snap = payload.get("snapshot", payload)
+
     applied = {"settings": 0, "config": {}, "overrides": False}
     try:
-        # 1) arbitrary settings rows
-        if isinstance(data.get("settings"), dict):
-            for k, v in data["settings"].items():
+        # 1) settings rows
+        if isinstance(snap.get("settings"), dict):
+            for k, v in snap["settings"].items():
                 try:
                     setting_set(str(k), v)
                     applied["settings"] += 1
                 except Exception:
                     pass
 
-        # 2) config (same keys as /auto/config)
-        if isinstance(data.get("config"), dict):
-            applied["config"] = _apply_config_updates(data["config"])
+        # 2) config
+        if isinstance(snap.get("config"), dict):
+            applied["config"] = _apply_config_updates(snap["config"])
 
-        # 3) per-symbol overrides (and persist)
-        if isinstance(data.get("overrides"), dict):
+        # 3) overrides
+        if isinstance(snap.get("overrides"), dict):
             _auto["overrides"] = {}
-            # normalize symbols -> UPPER
-            for sym, ov in data["overrides"].items():
+            for sym, ov in snap["overrides"].items():
                 if not isinstance(ov, dict): continue
                 s = (sym or "").upper().strip()
                 if not s: continue
                 _auto["overrides"][s] = dict(ov)
-                # refresh trail state off current avg
                 try:
                     avg = get_open_long_avg_price(s) or 0.0
                     ensure_trail_state(s, float(avg))
@@ -1020,7 +1019,8 @@ def _settings_import_view():
             except Exception:
                 applied["overrides"] = False
 
-        return jsonify(ok=True, applied=applied, config=_as_config_dict(), overrides=_auto.get("overrides", {}))
+        return jsonify(ok=True, applied=applied, config=_as_config_dict(),
+                       overrides=_auto.get("overrides", {}))
     except Exception as e:
         return jsonify(ok=False, error=f"import: {e}"), 500
 
