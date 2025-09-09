@@ -1498,94 +1498,80 @@ def auto_loop():
         )
 
         # cache filters once (tolerate invalid symbols)
-        flt = {}
-        bad = []
+        flt, bad = {}, []
         for s in AUTO_SYMBOLS:
             try:
                 info = client.get_symbol_info(s)
                 if not info or not info.get("filters"):
-                    bad.append(s)
-                    continue
+                    bad.append(s); continue
                 flt[s] = symbol_filters(client, s)
             except Exception:
                 bad.append(s)
-                
+
         valid_symbols = list(flt.keys())
         if bad:
             _auto["err"] = f"skipping invalid symbols: {','.join(bad)}"
             app.logger.warning("[AUTO] skipping invalid symbols: %s", bad)
 
-        allow_entry = bool(globals().get("ALLOW_TREND_ENTRY", False))
-        allow_exit  = bool(globals().get("ALLOW_TREND_EXIT",  False))
-
+        # indicator needs
         kl_needed = max(EMA_SLOW, RSI_LEN, ATR_LEN) + 2
-        kl_limit = KL_LIMIT if KL_LIMIT > 0 else kl_needed
+        kl_limit  = (KL_LIMIT if KL_LIMIT > 0 else max(kl_needed, 60))
 
         # start WS stream (best-effort; falls back to REST if unavailable)
         try:
             ws_start_kline_stream(valid_symbols, AUTO_INTERVAL)
         except Exception:
             pass
+
+        # main loop (single)
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
-            
-            # keep WS alive if enabled
             ws_supervisor_tick()
 
-            # --- balances: cached fetch with 1003 backoff, no 'continue' needed ---
             proceed = True
             sleep_after = None
 
-          # --- loss-streak cooldown state ---
+            # --- loss-streak cooldown state (enter/exit cleanly) ---
             now_ts = time.time()
             cooldown_active = (_auto.get("cooldown_until", 0) > now_ts)
-
-            if not cooldown_active:
-                try:
+            try:
+                if not cooldown_active:
                     ls = current_loss_streak()
                     if ls >= MAX_LOSS_STREAK:
                         _auto["cooldown_until"] = now_ts + LOSS_COOLDOWN_SEC
                         cooldown_active = True
                         log_decision("ALL", None, None, None, "HOLD", "loss-cooldown-start")
-            else:
-                # cooldown currently active; end if time passed
-                if now_ts >= _auto.get("cooldown_until", 0):
-                    _auto["cooldown_until"] = 0
-                    cooldown_active = False
-                    log_decision("ALL", None, None, None, "RESUME", "loss-cooldown-end")  
-                except Exception:
-                   pass
+                else:
+                    if now_ts >= float(_auto.get("cooldown_until", 0) or 0):
+                        _auto["cooldown_until"] = 0
+                        cooldown_active = False
+                        log_decision("ALL", None, None, None, "RESUME", "loss-cooldown-end")
+            except Exception:
+                # never let cooldown bookkeeping crash the loop
+                pass
 
-            # --- portfolio usage tracker for this tick (built from balances while we loop) ---
-            portfolio_notional = 0.0
-
+            # --- balances (cached; 1003-safe) ---
             bals = _auto.get("bals", {}) or {}
-            need_refresh = (_auto["loop"] % max(ACCOUNT_REFRESH_N, 1)) == 0
+            need_refresh = (_auto.get("loop", 0) % max(ACCOUNT_REFRESH_N, 1)) == 0
             if need_refresh:
                 try:
                     acct = client.get_account()
                     bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
                     _auto["bals"] = bals
                 except BinanceAPIException as e:
-                    msg = str(e)
-                    _auto["err"] = f"account: {msg}"
-                    try:
-                        app.logger.warning("[AUTO] account error: %s", msg)
-                    except Exception:
-                        pass
-                    if "-1003" in msg:  # request weight exceeded
-                        proceed = False
-                        sleep_after = max(sleep_after or 0, BACKOFF_1003_SEC)  # e.g. 65
+                    msg = str(e); _auto["err"] = f"account: {msg}"
+                    try: app.logger.warning("[AUTO] account error: %s", msg)
+                    except Exception: pass
+                    proceed = False
+                    if "-1003" in msg:
+                        sleep_after = max(sleep_after or 0, BACKOFF_1003_SEC)
                         log_decision("ALL", None, None, None, "HOLD", "backoff-1003")
                     else:
-                        proceed = False
                         sleep_after = max(sleep_after or 0, 10)
                 except Exception as e:
                     _auto["err"] = f"account: {e}"
-                    try:
-                        app.logger.warning("[AUTO] account error: %s", e)
-                    except Exception:
-                        pass
+                    try: app.logger.warning("[AUTO] account error: %s", e)
+                    except Exception: pass
                     proceed = False
                     sleep_after = max(sleep_after or 0, 10)
 
@@ -1594,41 +1580,36 @@ def auto_loop():
                 proceed = False
                 sleep_after = max(sleep_after or 0, 30)
 
-            # bail early this tick (no 'continue' — the rest of the loop is under 'proceed')
+            # bail early if we can’t do meaningful work this tick
             if not proceed:
-                _auto["loop"] += 1
-                _auto["stop"].wait(max(1, int(sleep_after or AUTO_POLL_SEC)))
-                continue  # <-- this 'continue' IS inside 'while', so it’s valid
-
-        while not _auto["stop"].is_set():
-            _auto["last"] = datetime.utcnow().isoformat()
-            ws_supervisor_tick()
-            if not proceed:
-                _auto["loop"] += 1
+                _auto["loop"] = int(_auto.get("loop", 0)) + 1
                 _auto["stop"].wait(max(1, int(sleep_after or AUTO_POLL_SEC)))
                 continue
 
-                    # --- klines (with rate-limit handling) ---
+            # ------------- per-symbol decisions -------------
+            for sym in valid_symbols:
+                try:
+                    if not can_trade(sym):
+                        log_decision(sym, None, None, None, "HOLD", "cooldown")
+                        continue
+
+                    # data (WS-first, REST fallback)
                     try:
                         kl = get_klines_any(client, sym, AUTO_INTERVAL, kl_limit)
                     except BinanceAPIException as e:
-                        msg = str(e)
-                        _auto["err"] = f"klines: {msg}"
+                        msg = str(e); _auto["err"] = f"klines: {msg}"
                         app.logger.warning("[AUTO] %s klines error: %s", sym, msg)
                         log_decision(sym, None, None, None, "HOLD", "klines-error")
-                        if "-1003" in msg:
-                            _auto["stop"].wait(BACKOFF_1003_SEC)
-                        else:
-                            _auto["stop"].wait(5)
+                        _auto["stop"].wait(BACKOFF_1003_SEC if "-1003" in msg else 5)
                         continue
 
-                    if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
+                    if not kl or len(kl) < kl_needed:
                         log_decision(sym, None, None, None, "HOLD", "few-bars")
-                        time.sleep(2)  # tiny pause to avoid rapid refetch
+                        # tiny pause to avoid rapid refetch when WS hasn’t filled yet
+                        _auto["stop"].wait(2)
                         continue
 
-
-                    # --- indicators ---
+                    # indicators
                     closes, ef, es, r = last_close_and_indicators(kl)
                     p1, p2 = ef[-2], ef[-1]
                     q1, q2 = es[-2], es[-1]
@@ -1643,31 +1624,27 @@ def auto_loop():
                     bear_x = bear_cross or (ALLOW_TREND_EXIT  and trend_dn)
 
                     price = float(closes[-1])
-                    base = sym.replace("USDT", "")
+                    base  = sym.replace("USDT", "")
                     base_bal = bals.get(base, 0.0)
 
-                    # --- ATR gate ---
+                    # ATR gate
                     atr_val = atr_from_klines(kl, ATR_LEN)
                     atr_pct = (atr_val / price * 100.0) if (atr_val is not None and price > 0) else None
                     if atr_pct is not None:
                         if atr_pct < ATR_MIN_PCT:
-                            log_decision(sym, p2, q2, rsi_now, "HOLD", "low-vol")
-                            continue
+                            log_decision(sym, p2, q2, rsi_now, "HOLD", "low-vol"); continue
                         if atr_pct > ATR_MAX_PCT:
-                            log_decision(sym, p2, q2, rsi_now, "HOLD", "high-vol")
-                            continue
+                            log_decision(sym, p2, q2, rsi_now, "HOLD", "high-vol"); continue
 
-                    # --- symbol filters ---
+                    # filters tuple for exec helpers
                     step_str, min_qty_str, min_notional = flt[sym]
                     f = (step_str, min_qty_str, min_notional)
 
-                    # --- panic / trailing / tpsl ---
+                    # panic / trailing / TP-SL
                     try:
                         rsi_map = {}
-                        if sym == "BTCUSDT":
-                            rsi_map["BTCUSDT"] = rsi_now
-                        if sym == "ETHUSDT":
-                            rsi_map["ETHUSDT"] = rsi_now
+                        if sym == "BTCUSDT": rsi_map["BTCUSDT"] = rsi_now
+                        if sym == "ETHUSDT": rsi_map["ETHUSDT"] = rsi_now
                         if panic_check_and_maybe_trigger(rsi_map):
                             _auto["enabled"] = False
                             if PANIC_MODE.upper() == "LIQUIDATE":
@@ -1677,23 +1654,23 @@ def auto_loop():
                         _auto["err"] = f"panic-check: {e}"
                         app.logger.warning("[AUTO] panic-check error: %s", e)
 
+                    # protective exits first
                     if base_bal > 0:
                         if eval_trailing_and_maybe_sell(client, sym, price, base_bal, f):
+                            # refresh balances best-effort
                             try:
                                 acct = client.get_account()
-                                bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-                            except Exception:
-                                pass
+                                _auto["bals"] = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                            except Exception: pass
                             continue
                         if eval_tpsl_and_maybe_sell(client, sym, price, base_bal, f):
                             try:
                                 acct = client.get_account()
-                                bals = {b["asset"]: float(b["free"]) for b in acct["balances"]}
-                            except Exception:
-                                pass
+                                _auto["bals"] = {b["asset"]: float(b["free"]) for b in acct["balances"]}
+                            except Exception: pass
                             continue
 
-                    # --- churn & exposure & throttle ---
+                    # throttles
                     sep_bps = ema_sep_bps(p2, q2)
                     buy_ok  = bull_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "BUY")  and (sep_bps >= EMA_SEP_BPS)
                     sell_ok = bear_x and confirmed_trend(ef, es, CROSS_CONFIRM_BARS, "SELL") and (sep_bps >= EMA_SEP_BPS)
@@ -1707,12 +1684,12 @@ def auto_loop():
                         _auto["minute_buys"] = {"when": now_min, "count": 0}
                     can_add_buy = (_auto["minute_buys"]["count"] < AUTO_MAX_BUYS_PER_MIN)
 
-                    # --- time window gate ---
+                    # time window
                     window_ok = schedule_allows_now_utc()
 
                     # -------------------- BUY --------------------
                     if (
-                        _auto["enabled"]
+                        _auto.get("enabled", False)
                         and window_ok
                         and not _auto.get("panic_armed", False)
                         and buy_ok
@@ -1722,21 +1699,23 @@ def auto_loop():
                         and can_add_buy
                     ):
                         if cooldown_active:
-                        # still allow protective sells (TP/SL/trailing), just block new buys
-                        # so *before* you place BUY:
-                        log_decision(sym, p2, q2, rsi_now, "HOLD", "loss-cooldown")
-                        continue
-                        # dynamic spend if enabled
+                            # block new entries during loss cooldown
+                            log_decision(sym, p2, q2, rsi_now, "HOLD", "loss-cooldown")
+                            continue
+
+                        # dynamic spend (ATR-aware) with min_notional floor
                         try:
-                            spend = (max(float(dynamic_spend_for_atr(atr_pct)), float(min_notional))
-                                     if DYN_RISK else max(float(AUTO_RISK_USDT), float(min_notional)))
+                            spend_dyn = dynamic_spend_for_atr(atr_pct)
+                        except Exception:
+                            spend_dyn = float(AUTO_RISK_USDT)
+                        try:
+                            spend = max(float(spend_dyn), float(min_notional))
                         except Exception:
                             spend = max(float(AUTO_RISK_USDT), float(min_notional))
 
                         try:
                             o = place_market_order(client, sym, "BUY",
-                                                   quoteOrderQty=f"{spend:.2f}", price_hint=price)                              
-                            
+                                                   quoteOrderQty=f"{spend:.2f}", price_hint=price)
                             record_trade_ts(sym)
 
                             fills = o.get("fills") or []
@@ -1778,9 +1757,7 @@ def auto_loop():
                         qty_str = qty_to_str(base_bal, step_str, min_qty_str)
                         if float(qty_str) * price >= min_notional and float(qty_str) > 0:
                             try:
-                                o = place_market_order(client, sym, "SELL",
-                                                       qty_str=qty_str, price_hint=price)
-                                    
+                                o = place_market_order(client, sym, "SELL", qty_str=qty_str, price_hint=price)
                                 record_trade_ts(sym)
 
                                 fills = o.get("fills") or []
@@ -1841,9 +1818,9 @@ def auto_loop():
                     _auto["err"] = str(e)
                     app.logger.exception("[AUTO] %s exception", sym)
 
-            # end for sym
-            _auto["loop"] += 1
-            _auto["stop"].wait(30)
+            # tick pacing
+            _auto["loop"] = int(_auto.get("loop", 0)) + 1
+            _auto["stop"].wait(max(1, int(AUTO_POLL_SEC)))
 
         # end while
         app.logger.info("[AUTO] stopped")
