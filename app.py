@@ -2293,7 +2293,7 @@ _register("/trail/delete",    "trail_overrides_delete_v2", ["POST"], _trail_over
 _register("/panic/hedge",   "panic_hedge_v2",   ["POST"], _panic_hedge_view)
 _register("/panic/clear",   "panic_clear_v2",   ["POST"], _panic_clear_view)
 _register("/ws/start",  "ws_start",  ["POST"], _ws_start_view)
-_register("/ws/status", "ws_status", ["GET"],  _ws_status_view)
+#_register("/ws/status", "ws_status", ["GET"],  _ws_status_view)
 _register("/ws/stop",   "ws_stop",   ["POST"], _ws_stop_view)
 
 def _auto_step_view():
