@@ -1547,12 +1547,12 @@ def auto_loop():
                         _auto["cooldown_until"] = now_ts + LOSS_COOLDOWN_SEC
                         cooldown_active = True
                         log_decision("ALL", None, None, None, "HOLD", "loss-cooldown-start")
-                    else:
-                         # cooldown currently active; end if time passed
-                         if now_ts >= _auto.get("cooldown_until", 0):
-                         _auto["cooldown_until"] = 0
-                         cooldown_active = False
-                         log_decision("ALL", None, None, None, "RESUME", "loss-cooldown-end")  
+            else:
+                # cooldown currently active; end if time passed
+                if now_ts >= _auto.get("cooldown_until", 0):
+                    _auto["cooldown_until"] = 0
+                    cooldown_active = False
+                    log_decision("ALL", None, None, None, "RESUME", "loss-cooldown-end")  
                 except Exception:
                     pass
 
