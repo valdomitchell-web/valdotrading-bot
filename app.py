@@ -1834,7 +1834,7 @@ def auto_loop():
             _auto["stop"].wait(max(1, int(AUTO_POLL_SEC)))
 
         # end while
-        app.logger.info("[AUTO] stopped")
+        #app.logger.info("[AUTO] stopped")
 
 # --- robust route (re)registration helpers (no decorators) ---
 def _replace_route(rule: str, endpoint: str):
