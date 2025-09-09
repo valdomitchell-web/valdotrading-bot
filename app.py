@@ -375,6 +375,9 @@ from decimal import Decimal
 from datetime import datetime
 from binance.exceptions import BinanceAPIException
 
+if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+    raise RuntimeError("Missing BINANCE_API_KEY / BINANCE_API_SECRET in .env")
+
 # --- knobs ---
 def env_true(name, default="false"):
     return str(os.getenv(name, default)).strip().lower() in ("1","true","yes","y","on")
@@ -538,10 +541,18 @@ def ws_supervisor_tick():
 
         if not any_fresh:
             # everything looks stale — bounce the sockets
-            stop_ws()
+            ws_stop()
             ws_start_kline_stream(keys and [k.split(":")[0] for k in keys], itv)
     except Exception as e:
         _ws["err"] = f"ws-stale-check: {e}"
+
+def start_ws_if_needed():
+    # wrapper used by ws_supervisor_tick
+    return ws_start_kline_stream(AUTO_SYMBOLS, AUTO_INTERVAL)
+
+def stop_ws():
+    # wrapper used by ws_supervisor_tick
+    ws_stop()
 
 # ============ WebSocket kline cache/manager ============
 import threading
@@ -554,7 +565,7 @@ except Exception:
 
 def _ensure_stream(symbol, interval):
     itv = str(AUTO_INTERVAL).lower()
-    key = f"{symbol}:{itv}"     # <-- was {s}:{itv}
+    key = f"{symbol}:{itv}"   # <- use 'symbol' not 's'
     if key not in _ws["streams"]:
         _ws["streams"][key] = deque(maxlen=max(WS_KLINE_LIMIT, 1))
     return _ws["streams"][key]
