@@ -1554,7 +1554,7 @@ def auto_loop():
                     cooldown_active = False
                     log_decision("ALL", None, None, None, "RESUME", "loss-cooldown-end")  
                 except Exception:
-                    pass
+                   pass
 
             # --- portfolio usage tracker for this tick (built from balances while we loop) ---
             portfolio_notional = 0.0
