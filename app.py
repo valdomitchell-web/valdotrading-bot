@@ -524,26 +524,22 @@ def ws_supervisor_tick():
     # running: check freshness
     try:
         try:
-            stale_sec = int(globals().get("WS_STALE_SEC", 12))
+            stale_sec = int(globals().get("WS_STALE_SEC", 60))
         except Exception:
-            stale_sec = 12
+            stale_sec = 60
 
         itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
-        keys = [f"{str(s).upper()}:{itv}" for s in globals().get("AUTO_SYMBOLS", ["BTCUSDT"])]
+        keys = [f"{s.upper()}:{itv}" for s in globals().get("AUTO_SYMBOLS", ["BTCUSDT"])]
 
         now_ms = int(time.time() * 1000)
         last_map = _ws.get("last_evt_ms", {})
         any_fresh = False
-        for k in keys:
-            evt = last_map.get(k)
-            if evt and (now_ms - int(evt) <= stale_sec * 1000):
-                any_fresh = True
-                break
+        any_fresh = any(last_map.get(k) and (now_ms - int(last_map[k]) <= stale_sec*1000) for k in keys)
 
         if not any_fresh:
             # everything looks stale — bounce the sockets
             stop_ws()
-            start_ws_if_needed()
+            ws_start_kline_stream(keys and [k.split(":")[0] for k in keys], itv)
     except Exception as e:
         _ws["err"] = f"ws-stale-check: {e}"
 
@@ -558,7 +554,7 @@ except Exception:
 
 def _ensure_stream(symbol, interval):
     itv = str(AUTO_INTERVAL).lower()
-    key = f"{s}:{itv}"
+    key = f"{symbol}:{itv}"     # <-- was {s}:{itv}
     if key not in _ws["streams"]:
         _ws["streams"][key] = deque(maxlen=max(WS_KLINE_LIMIT, 1))
     return _ws["streams"][key]
@@ -1282,6 +1278,18 @@ def panic_check_and_maybe_trigger(rsi_map):
         return False
     except Exception:
         return False
+        
+# put this near other WS helpers
+def stop_ws():
+    """Stop the ThreadedWebsocketManager safely."""
+    twm = _ws.get("twm")
+    try:
+        if twm:
+            twm.stop()
+    except Exception:
+        pass
+    _ws["twm"] = None
+    _ws["running"] = False
 
 def panic_liquidate_all(client, symbols, bals, flt_map):
     """
@@ -1539,6 +1547,12 @@ def auto_loop():
                         _auto["cooldown_until"] = now_ts + LOSS_COOLDOWN_SEC
                         cooldown_active = True
                         log_decision("ALL", None, None, None, "HOLD", "loss-cooldown-start")
+                    else:
+                         # cooldown currently active; end if time passed
+                         if now_ts >= _auto.get("cooldown_until", 0):
+                         _auto["cooldown_until"] = 0
+                         cooldown_active = False
+                         log_decision("ALL", None, None, None, "RESUME", "loss-cooldown-end")  
                 except Exception:
                     pass
 
@@ -1589,14 +1603,10 @@ def auto_loop():
         while not _auto["stop"].is_set():
             _auto["last"] = datetime.utcnow().isoformat()
             ws_supervisor_tick()
-
-            # ... your balances / proceed logic above ...
-
-            for sym in valid_symbols:
-                try:
-                    if not can_trade(sym):
-                        log_decision(sym, None, None, None, "HOLD", "cooldown")
-                        continue
+            if not proceed:
+                _auto["loop"] += 1
+                _auto["stop"].wait(max(1, int(sleep_after or AUTO_POLL_SEC)))
+                continue
 
                     # --- klines (with rate-limit handling) ---
                     try:
@@ -1614,7 +1624,9 @@ def auto_loop():
 
                     if not kl or len(kl) < max(EMA_SLOW, RSI_LEN) + 2:
                         log_decision(sym, None, None, None, "HOLD", "few-bars")
+                        time.sleep(2)  # tiny pause to avoid rapid refetch
                         continue
+
 
                     # --- indicators ---
                     closes, ef, es, r = last_close_and_indicators(kl)
@@ -1709,6 +1721,11 @@ def auto_loop():
                         and under_cap
                         and can_add_buy
                     ):
+                        if cooldown_active:
+                        # still allow protective sells (TP/SL/trailing), just block new buys
+                        # so *before* you place BUY:
+                        log_decision(sym, p2, q2, rsi_now, "HOLD", "loss-cooldown")
+                        continue
                         # dynamic spend if enabled
                         try:
                             spend = (max(float(dynamic_spend_for_atr(atr_pct)), float(min_notional))
@@ -2006,7 +2023,6 @@ def _on_kline(msg):
         v = float(k.get("v") or 0)
 
         row = [t_open, o, h, l, c, v, t_close]
-
         dq = _ws["streams"].get(key)
         if dq is None:
             from collections import deque
@@ -2019,7 +2035,8 @@ def _on_kline(msg):
         else:
             dq.append(row)
 
-        _ws["last"][key] = int(msg.get("E") or time.time() * 1000)
+        _ws["last"][key] = t_close or int(msg.get("E") or time.time()*1000)
+        _ws.setdefault("last_evt_ms", {})[key] = int(msg.get("E") or time.time()*1000)
     except Exception as e:
         _ws["err"] = f"on_kline:{e}"
 
@@ -2575,6 +2592,30 @@ def infer_source_from_request(req, default='manual'):
     ):
         return 'webhook'
     return default
+
+@app.get("/ws/status")
+def ws_status():
+    try:
+        itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        out = {}
+        now = int(time.time() * 1000)
+        for key, dq in (_ws.get("streams") or {}).items():
+            last_ms = _ws.get("last", {}).get(key) or _ws.get("last_evt_ms", {}).get(key) or 0
+            # bars = len(dq) if dq is a deque of klines
+            bars = len(dq) if dq is not None else 0
+            out[key] = {
+                "bars": bars,
+                "last_age_sec": round((now - int(last_ms))/1000.0, 1) if last_ms else None
+            }
+        return jsonify(ok=True, running=bool(_ws.get("running")), status=out, err=_ws.get("err"))
+    except Exception as e:
+        return jsonify(ok=True, running=False, err=f"ws-status: {e}")
+
+@app.post("/auto/cooldown/clear")
+def clear_loss_cooldown():
+    if not require_admin(): return jsonify(ok=False), 401
+    _auto["cooldown_until"] = 0
+    return jsonify(ok=True)
 
 @app.post("/positions/reconcile")
 def positions_reconcile():
