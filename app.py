@@ -245,24 +245,21 @@ def max_sellable_base(symbol: str) -> tuple[Decimal, dict]:
     return floored, {"price": str(price), "free_base": str(free_base)}
 
 # Compatibility shim so the auto loop can call one function
-def place_market_order(client, symbol: str, side: str, quoteOrderQty=None, qty_str=None, price_hint=None):
-    """
-    Accepts either a quote amount (USDT) via quoteOrderQty or a base qty via qty_str.
-    Uses python-binance create_order under the hood.
-    """
-    side = side.upper()
-    if quoteOrderQty is not None:
-        return client.create_order(
-            symbol=symbol, side=side, type=Client.ORDER_TYPE_MARKET,
-            quoteOrderQty=str(float(quoteOrderQty)), recvWindow=10000
-        )
-    elif qty_str is not None:
-        return client.create_order(
-            symbol=symbol, side=side, type=Client.ORDER_TYPE_MARKET,
-            quantity=str(qty_str), recvWindow=10000
-        )
-    else:
-        raise ValueError("place_market_order requires quoteOrderQty or qty_str")
+def place_market_order(client, sym, side, qty_str=None, quoteOrderQty=None, price_hint=None):
+    # obey DRY_RUN
+    if globals().get("DRY_RUN", False):
+        # fabricate a "FILLED" response shape like Binance's
+        return {
+            "status": "FILLED",
+            "executedQty": qty_str or "0",
+            "cummulativeQuoteQty": quoteOrderQty or "0",
+            "fills": []
+        }
+    # live
+    kwargs = dict(symbol=sym, side=side, type=Client.ORDER_TYPE_MARKET, recvWindow=10000)
+    if qty_str: kwargs["quantity"] = qty_str
+    if quoteOrderQty: kwargs["quoteOrderQty"] = quoteOrderQty
+    return client.create_order(**kwargs)
 
 def place_live_market_order(symbol: str, side: str, amount: float, use_quote=False):
     c = get_binance_client()
@@ -589,45 +586,6 @@ def _ensure_stream(symbol, interval):
     if key not in _ws["streams"]:
         _ws["streams"][key] = deque(maxlen=max(WS_KLINE_LIMIT, 1))
     return _ws["streams"][key]
-
-def _on_kline(msg):
-    """Normalize Binance WS kline to the same shape we read everywhere."""
-    try:
-        if msg.get("e") != "kline":
-            return
-        k = msg.get("k") or {}
-        s = (msg.get("s") or k.get("s") or "").upper()
-        itv = (k.get("i") or str(globals().get("AUTO_INTERVAL", "30m"))).lower()
-        key = f"{s}:{itv}"
-
-        t_open  = int(k.get("t") or 0)
-        t_close = int(k.get("T") or 0)
-        o = float(k.get("o") or 0)
-        h = float(k.get("h") or 0)
-        l = float(k.get("l") or 0)
-        c = float(k.get("c") or 0)
-        v = float(k.get("v") or 0)
-
-        row = [t_open, o, h, l, c, v, t_close]
-
-        dq = _ws["streams"].get(key)
-        if dq is None:
-            from collections import deque
-            dq = deque(maxlen=max(int(globals().get("WS_KLINE_LIMIT", 240)), 1))
-            _ws["streams"][key] = dq
-
-        # upsert last bar by open time
-        if dq and dq[-1][0] == t_open:
-            dq[-1] = row
-        else:
-            dq.append(row)
-
-       #now_ms = int(time.time() * 1000)
-       #_ws["last"][key] = min(now_ms, t_close or now_ms)
-       # (if you prefer event time E): _ws["last"][key] = min(now_ms, int(msg.get("E") or now_ms))
-
-    except Exception as e:
-        _ws["err"] = f"on_kline:{e}"
         
 def prime_ws_cache_via_rest():
     """Backfill a few bars so status/step work instantly."""
@@ -2015,12 +1973,12 @@ def _on_kline(msg):
         else:
             dq.append(row)
             
-        now_ms = int(time.time() * 1000)
-        _ws["last"][key] = min(now_ms, t_close or now_ms)
+        #now_ms = int(time.time() * 1000)
+        #_ws["last"][key] = min(now_ms, t_close or now_ms)
         # (if you prefer event time E): _ws["last"][key] = min(now_ms, int(msg.get("E") or now_ms))
 
-        #_ws["last"][key] = t_close or int(msg.get("E") or time.time()*1000)
-        #_ws.setdefault("last_evt_ms", {})[key] = int(msg.get("E") or time.time()*1000)
+        _ws["last"][key] = t_close or int(msg.get("E") or time.time()*1000)
+        _ws.setdefault("last_evt_ms", {})[key] = int(msg.get("E") or time.time()*1000)
     except Exception as e:
         _ws["err"] = f"on_kline:{e}"
 
@@ -2176,6 +2134,7 @@ def _ws_start_view():
     ok = ws_start_kline_stream(AUTO_SYMBOLS, AUTO_INTERVAL)
     return jsonify(ok=bool(ok), running=_ws.get("running"), err=_ws.get("err"))
 
+# keep ONLY this definition, no @app.get decorator
 def _ws_status_view():
     if not require_admin():
         return jsonify(ok=False, error="auth"), 401
@@ -2186,13 +2145,20 @@ def _ws_status_view():
     status = {}
     for s in AUTO_SYMBOLS:
         key = f"{str(s).upper()}:{itv}"
-        buf = _ws["streams"].get(key)
-        bars = len(buf) if buf else 0
-        last_ms = _ws["last"].get(key)
-        last_age_sec = (round(max(0, now_ms - last_ms) / 1000.0, 1) if last_ms else None)
-        status[key] = {"bars": bars, "last_age_sec": last_age_sec}
+        dq = _ws.get("streams", {}).get(key)
+        bars = len(dq) if dq else 0
 
-    return jsonify(ok=True, running=bool(_ws.get("running")), err=_ws.get("err"), status=status)
+        # prefer last event time; fall back to last close time
+        last_ms = _ws.get("last_evt_ms", {}).get(key) or _ws.get("last", {}).get(key)
+        age_sec = None
+        if last_ms:
+            # clamp so it never goes negative if last_ms is a future close time
+            age_sec = round(max(0, now_ms - int(last_ms)) / 1000.0, 1)
+
+        status[key] = {"bars": bars, "last_age_sec": age_sec}
+
+    return jsonify(ok=True, running=bool(_ws.get("running")),
+                   err=_ws.get("err"), status=status)
 
 def ws_stop():
     twm = _ws.get("twm")
@@ -2289,7 +2255,7 @@ _register("/trail/delete",    "trail_overrides_delete_v2", ["POST"], _trail_over
 _register("/panic/hedge",   "panic_hedge_v2",   ["POST"], _panic_hedge_view)
 _register("/panic/clear",   "panic_clear_v2",   ["POST"], _panic_clear_view)
 _register("/ws/start",  "ws_start",  ["POST"], _ws_start_view)
-#_register("/ws/status", "ws_status", ["GET"],  _ws_status_view)
+_register("/ws/status", "ws_status", ["GET"],  _ws_status_view)
 _register("/ws/stop",   "ws_stop",   ["POST"], _ws_stop_view)
 
 def _auto_step_view():
@@ -2577,23 +2543,23 @@ def infer_source_from_request(req, default='manual'):
         return 'webhook'
     return default
 
-@app.get("/ws/status")
-def ws_status():
-    try:
-        itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
-        out = {}
-        now = int(time.time() * 1000)
-        for key, dq in (_ws.get("streams") or {}).items():
-            last_ms = _ws.get("last", {}).get(key) or _ws.get("last_evt_ms", {}).get(key) or 0
+#@app.get("/ws/status")
+#def ws_status():
+    #try:
+        #itv = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+        #out = {}
+        #now = int(time.time() * 1000)
+        #for key, dq in (_ws.get("streams") or {}).items():
+            #last_ms = _ws.get("last", {}).get(key) or _ws.get("last_evt_ms", {}).get(key) or 0
             # bars = len(dq) if dq is a deque of klines
-            bars = len(dq) if dq is not None else 0
-            out[key] = {
-                "bars": bars,
-                "last_age_sec": round((now - int(last_ms))/1000.0, 1) if last_ms else None
-            }
-        return jsonify(ok=True, running=bool(_ws.get("running")), status=out, err=_ws.get("err"))
-    except Exception as e:
-        return jsonify(ok=True, running=False, err=f"ws-status: {e}")
+            #bars = len(dq) if dq is not None else 0
+            #out[key] = {
+                #"bars": bars,
+                #"last_age_sec": round((now - int(last_ms))/1000.0, 1) if last_ms else None
+            #}
+        #return jsonify(ok=True, running=bool(_ws.get("running")), status=out, err=_ws.get("err"))
+    #except Exception as e:
+        #return jsonify(ok=True, running=False, err=f"ws-status: {e}")
 
 @app.post("/auto/cooldown/clear")
 def clear_loss_cooldown():
