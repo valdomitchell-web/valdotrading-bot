@@ -622,7 +622,7 @@ def _on_kline(msg):
         else:
             dq.append(row)
 
-       now_ms = int(time.time() * 1000)
+       #now_ms = int(time.time() * 1000)
        _ws["last"][key] = min(now_ms, t_close or now_ms)
        # (if you prefer event time E): _ws["last"][key] = min(now_ms, int(msg.get("E") or now_ms))
 
