@@ -244,6 +244,26 @@ def max_sellable_base(symbol: str) -> tuple[Decimal, dict]:
         return Decimal("0"), {"reason": f"below minNotional {minNotional}"}
     return floored, {"price": str(price), "free_base": str(free_base)}
 
+# Compatibility shim so the auto loop can call one function
+def place_market_order(client, symbol: str, side: str, quoteOrderQty=None, qty_str=None, price_hint=None):
+    """
+    Accepts either a quote amount (USDT) via quoteOrderQty or a base qty via qty_str.
+    Uses python-binance create_order under the hood.
+    """
+    side = side.upper()
+    if quoteOrderQty is not None:
+        return client.create_order(
+            symbol=symbol, side=side, type=Client.ORDER_TYPE_MARKET,
+            quoteOrderQty=str(float(quoteOrderQty)), recvWindow=10000
+        )
+    elif qty_str is not None:
+        return client.create_order(
+            symbol=symbol, side=side, type=Client.ORDER_TYPE_MARKET,
+            quantity=str(qty_str), recvWindow=10000
+        )
+    else:
+        raise ValueError("place_market_order requires quoteOrderQty or qty_str")
+
 def place_live_market_order(symbol: str, side: str, amount: float, use_quote=False):
     c = get_binance_client()
     side = side.upper()
@@ -602,7 +622,10 @@ def _on_kline(msg):
         else:
             dq.append(row)
 
-        _ws["last"][key] = int(msg.get("E") or time.time() * 1000)
+       now_ms = int(time.time() * 1000)
+       _ws["last"][key] = min(now_ms, t_close or now_ms)
+       # (if you prefer event time E): _ws["last"][key] = min(now_ms, int(msg.get("E") or now_ms))
+
     except Exception as e:
         _ws["err"] = f"on_kline:{e}"
         
@@ -2022,9 +2045,13 @@ def _on_kline(msg):
             dq[-1] = row
         else:
             dq.append(row)
+            
+        now_ms = int(time.time() * 1000)
+        _ws["last"][key] = min(now_ms, t_close or now_ms)
+        # (if you prefer event time E): _ws["last"][key] = min(now_ms, int(msg.get("E") or now_ms))
 
-        _ws["last"][key] = t_close or int(msg.get("E") or time.time()*1000)
-        _ws.setdefault("last_evt_ms", {})[key] = int(msg.get("E") or time.time()*1000)
+        #_ws["last"][key] = t_close or int(msg.get("E") or time.time()*1000)
+        #_ws.setdefault("last_evt_ms", {})[key] = int(msg.get("E") or time.time()*1000)
     except Exception as e:
         _ws["err"] = f"on_kline:{e}"
 
