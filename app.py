@@ -623,7 +623,7 @@ def _on_kline(msg):
             dq.append(row)
 
        #now_ms = int(time.time() * 1000)
-       _ws["last"][key] = min(now_ms, t_close or now_ms)
+       #_ws["last"][key] = min(now_ms, t_close or now_ms)
        # (if you prefer event time E): _ws["last"][key] = min(now_ms, int(msg.get("E") or now_ms))
 
     except Exception as e:
@@ -656,37 +656,6 @@ def prime_ws_cache_via_rest():
                 pass
     except Exception as e:
         _ws["err"] = f"ws-prime:{e}"
-
-def _ws_on_kline(msg):
-    """Binance WS callback; normalizes to REST-like kline rows."""
-    try:
-        if not msg or msg.get("e") != "kline":
-            return
-        s = (msg.get("s") or "").upper()
-        k = msg.get("k") or {}
-        interval = k.get("i")
-        t_open  = int(k.get("t") or 0)
-        t_close = int(k.get("T") or 0)
-        o = str(k.get("o") or "0")
-        h = str(k.get("h") or "0")
-        l = str(k.get("l") or "0")
-        c = str(k.get("c") or "0")
-        # Build a REST-like row (we only consume OHLC + times)
-        row = [t_open, o, h, l, c, "0", "0", t_close, "0", "0", "0", "0"]
-
-        key = f"{s}:{interval}"
-        with _ws["lock"]:
-            dq = _ws["cache"].get(key)
-            if dq is None:
-                dq = deque(maxlen=WS_KLINE_LIMIT)
-                _ws["cache"][key] = dq
-            if dq and dq[-1][0] == t_open:
-                dq[-1] = row
-            else:
-                dq.append(row)
-            _ws["last_update"][key] = time.time()
-    except Exception as ex:
-        _ws["err"] = str(ex)
 
 def _ws_key(sym: str, interval: str) -> str:
     # Symbols come uppercase from Binance; interval is lowercase like "30m"
