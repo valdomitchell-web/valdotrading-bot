@@ -564,8 +564,16 @@ def ws_supervisor_tick():
         _ws["err"] = f"ws-stale-check: {e}"
 
 def start_ws_if_needed():
-    # wrapper used by ws_supervisor_tick
-    return ws_start_kline_stream(AUTO_SYMBOLS, AUTO_INTERVAL)
+    if _ws.get("running"):
+        return True
+    # seed a few recent bars so status/step have data immediately
+    try:
+        prime_ws_cache_via_rest()
+    except Exception:
+        pass
+    syms = globals().get("AUTO_SYMBOLS", ["BTCUSDT"])
+    itv  = str(globals().get("AUTO_INTERVAL", "30m")).lower()
+    return ws_start_kline_stream(syms, itv)
 
 def stop_ws():
     # wrapper used by ws_supervisor_tick
@@ -580,11 +588,12 @@ try:
 except Exception:
     ThreadedWebsocketManager = None
 
+# --- FIX: _ensure_stream used wrong variable name ---
 def _ensure_stream(symbol, interval):
-    itv = str(AUTO_INTERVAL).lower()
-    key = f"{symbol}:{itv}"   # <- use 'symbol' not 's'
+    itv = str(interval or AUTO_INTERVAL).lower()
+    key = f"{str(symbol).upper()}:{itv}"
     if key not in _ws["streams"]:
-        _ws["streams"][key] = deque(maxlen=max(WS_KLINE_LIMIT, 1))
+        _ws["streams"][key] = deque(maxlen=max(int(globals().get("WS_KLINE_LIMIT", 240)), 1))
     return _ws["streams"][key]
         
 def prime_ws_cache_via_rest():
@@ -1942,8 +1951,8 @@ try:
 except NameError:
     _ws = {"twm": None, "streams": {}, "last": {}, "running": False, "err": None}
 
+# --- OPTIONAL: record last event ms in _on_kline for freshness checks ---
 def _on_kline(msg):
-    """Normalize Binance WS kline to the same shape we read everywhere."""
     try:
         if msg.get("e") != "kline":
             return
@@ -1959,26 +1968,22 @@ def _on_kline(msg):
         l = float(k.get("l") or 0)
         c = float(k.get("c") or 0)
         v = float(k.get("v") or 0)
-
         row = [t_open, o, h, l, c, v, t_close]
+
         dq = _ws["streams"].get(key)
         if dq is None:
             from collections import deque
             dq = deque(maxlen=max(int(globals().get("WS_KLINE_LIMIT", 240)), 1))
             _ws["streams"][key] = dq
 
-        # upsert last bar by open time
         if dq and dq[-1][0] == t_open:
             dq[-1] = row
         else:
             dq.append(row)
-            
-        #now_ms = int(time.time() * 1000)
-        #_ws["last"][key] = min(now_ms, t_close or now_ms)
-        # (if you prefer event time E): _ws["last"][key] = min(now_ms, int(msg.get("E") or now_ms))
 
-        _ws["last"][key] = t_close or int(msg.get("E") or time.time()*1000)
-        _ws.setdefault("last_evt_ms", {})[key] = int(msg.get("E") or time.time()*1000)
+        evt_ms = int(msg.get("E") or time.time() * 1000)
+        _ws["last"][key] = t_close or evt_ms
+        _ws["last_evt_ms"][key] = evt_ms  # <— helps freshness checks
     except Exception as e:
         _ws["err"] = f"on_kline:{e}"
 
